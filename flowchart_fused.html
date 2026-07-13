@@ -1,0 +1,699 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8"/>
+<meta name="viewport" content="width=device-width, initial-scale=1.0"/>
+<title>Fused Temporal SLIC — Flowchart</title>
+<link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;600;700&family=DM+Sans:wght@300;400;500;600&display=swap" rel="stylesheet"/>
+<style>
+  :root {
+    --bg:      #f4f1ec;
+    --panel:   #ffffff;
+    --border:  #d6cebd;
+    --ink:     #1a1612;
+    --ink2:    #5a5248;
+    --ink3:    #9a9088;
+
+    --teal:    #007a7a;
+    --teal-lt: #e0f2f2;
+    --amber:   #b86000;
+    --amber-lt:#fff0d8;
+    --blue:    #1a4f9c;
+    --blue-lt: #dde8f7;
+    --rose:    #9c1a3a;
+    --rose-lt: #fde8ee;
+    --olive:   #4a6e1a;
+    --olive-lt:#eaf4d8;
+    --plum:    #5a1a7a;
+    --plum-lt: #f0e0ff;
+  }
+
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+
+  body {
+    background: var(--bg);
+    background-image:
+      radial-gradient(circle at 20% 15%, rgba(0,122,122,.04) 0%, transparent 55%),
+      radial-gradient(circle at 80% 85%, rgba(184,96,0,.04)  0%, transparent 55%);
+    font-family: 'DM Sans', sans-serif;
+    color: var(--ink);
+    min-height: 100vh;
+    padding: 48px 24px 70px;
+  }
+
+  /* ── HEADER ── */
+  .header {
+    text-align: center;
+    margin-bottom: 10px;
+  }
+  .header .eyebrow {
+    font-family: 'IBM Plex Mono', monospace;
+    font-size: .62rem;
+    font-weight: 600;
+    letter-spacing: .2em;
+    text-transform: uppercase;
+    color: var(--ink3);
+    margin-bottom: 10px;
+  }
+  .header h1 {
+    font-size: 1.5rem;
+    font-weight: 600;
+    color: var(--ink);
+    line-height: 1.2;
+    margin-bottom: 8px;
+  }
+  .header h1 em {
+    font-style: normal;
+    color: var(--teal);
+    border-bottom: 2px solid var(--teal);
+    padding-bottom: 1px;
+  }
+  .header .sub {
+    font-size: .75rem;
+    color: var(--ink2);
+    font-family: 'IBM Plex Mono', monospace;
+  }
+  .divider {
+    width: 60px;
+    height: 2px;
+    background: var(--border);
+    margin: 16px auto 30px;
+    border-radius: 2px;
+  }
+
+  /* ── LEGEND ── */
+  .legend {
+    display: flex;
+    gap: 20px;
+    justify-content: center;
+    flex-wrap: wrap;
+    margin-bottom: 44px;
+    font-size: .68rem;
+    font-family: 'IBM Plex Mono', monospace;
+    color: var(--ink2);
+  }
+  .legend-item {
+    display: flex;
+    align-items: center;
+    gap: 7px;
+  }
+  .legend-pip {
+    width: 10px; height: 10px;
+    border-radius: 2px;
+    flex-shrink: 0;
+  }
+
+  /* ── CHART ── */
+  .chart {
+    max-width: 1020px;
+    margin: 0 auto;
+  }
+
+  .flat {
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    gap: 0;
+  }
+
+  /* ── NODES ── */
+  .node {
+    border-radius: 6px;
+    padding: 12px 16px;
+    font-size: .71rem;
+    line-height: 1.55;
+    width: 100%;
+    border: 1.5px solid;
+    transition: box-shadow .15s, transform .15s;
+    cursor: default;
+    background: var(--panel);
+    border-color: var(--border);
+  }
+  .node:hover {
+    box-shadow: 0 4px 18px rgba(0,0,0,.1);
+    transform: translateY(-1px);
+  }
+  .node-title {
+    font-family: 'IBM Plex Mono', monospace;
+    font-weight: 700;
+    font-size: .67rem;
+    letter-spacing: .05em;
+    margin-bottom: 5px;
+    display: flex;
+    align-items: center;
+    gap: 7px;
+  }
+  .node-body {
+    color: var(--ink2);
+    font-size: .68rem;
+    line-height: 1.6;
+  }
+  .badge {
+    font-family: 'IBM Plex Mono', monospace;
+    font-size: .53rem;
+    font-weight: 700;
+    padding: 1px 6px;
+    border-radius: 12px;
+    letter-spacing: .08em;
+    text-transform: uppercase;
+    flex-shrink: 0;
+  }
+
+  /* color themes */
+  .n-io {
+    border-color: var(--border);
+    border-style: dashed;
+    background: #faf8f4;
+    border-radius: 32px;
+  }
+  .n-io .node-title { color: var(--ink2); justify-content: center; }
+  .n-io .node-body  { text-align: center; }
+
+  .n-teal { border-color: var(--teal); background: var(--teal-lt); }
+  .n-teal .node-title { color: var(--teal); }
+
+  .n-blue { border-color: var(--blue); background: var(--blue-lt); }
+  .n-blue .node-title { color: var(--blue); }
+
+  .n-amber { border-color: var(--amber); background: var(--amber-lt); }
+  .n-amber .node-title { color: var(--amber); }
+
+  .n-olive { border-color: var(--olive); background: var(--olive-lt); }
+  .n-olive .node-title { color: var(--olive); }
+
+  .n-rose  { border-color: var(--rose); background: var(--rose-lt); }
+  .n-rose  .node-title { color: var(--rose); }
+
+  .n-plum  { border-color: var(--plum); background: var(--plum-lt); }
+  .n-plum  .node-title { color: var(--plum); }
+
+  .badge-1 { background: var(--blue-lt);  color: var(--blue); }
+  .badge-2 { background: var(--amber-lt); color: var(--amber); }
+  .badge-3 { background: var(--olive-lt); color: var(--olive); }
+  .badge-4 { background: var(--rose-lt);  color: var(--rose); }
+
+  /* ── CONNECTORS ── */
+  .conn {
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    width: 100%;
+  }
+  .vl {
+    width: 1.5px;
+    height: 14px;
+    background: var(--border);
+  }
+  .arr {
+    width: 0; height: 0;
+    border-left: 4px solid transparent;
+    border-right: 4px solid transparent;
+    border-top: 6px solid var(--ink3);
+  }
+
+  .loop-pill {
+    display: inline-block;
+    font-family: 'IBM Plex Mono', monospace;
+    font-size: .58rem;
+    font-weight: 600;
+    letter-spacing: .1em;
+    text-transform: uppercase;
+    padding: 4px 14px;
+    border-radius: 20px;
+    border: 1.5px solid var(--border);
+    background: var(--panel);
+    color: var(--ink3);
+    margin: 7px 0;
+  }
+
+  /* ── PHASE HEADERS ── */
+  .phase-hdr {
+    width: 100%;
+    text-align: center;
+    margin: 10px 0 14px;
+    position: relative;
+  }
+  .phase-hdr::before {
+    content: '';
+    position: absolute;
+    top: 50%;
+    left: 0; right: 0;
+    height: 1px;
+    background: var(--border);
+    z-index: 0;
+  }
+  .phase-hdr span {
+    position: relative;
+    z-index: 1;
+    background: var(--bg);
+    padding: 0 14px;
+    font-family: 'IBM Plex Mono', monospace;
+    font-size: .62rem;
+    font-weight: 700;
+    letter-spacing: .14em;
+    text-transform: uppercase;
+    color: var(--ink2);
+  }
+
+  /* ── GRIDS ── */
+  .grid-2 {
+    display: grid;
+    grid-template-columns: 1fr 1fr;
+    gap: 14px;
+    width: 100%;
+    max-width: 780px;
+  }
+  .grid-3 {
+    display: grid;
+    grid-template-columns: 1fr 1fr 1fr;
+    gap: 12px;
+    width: 100%;
+    max-width: 960px;
+  }
+  .grid-4 {
+    display: grid;
+    grid-template-columns: 1fr 1fr 1fr 1fr;
+    gap: 12px;
+    width: 100%;
+    max-width: 960px;
+  }
+
+  .sub-col {
+    display: flex;
+    flex-direction: column;
+    align-items: stretch;
+    gap: 10px;
+  }
+
+  /* ── BRANCH BOX ── */
+  .branch-box {
+    border: 1.5px solid var(--plum);
+    border-radius: 8px;
+    background: var(--plum-lt);
+    padding: 14px 16px;
+    text-align: center;
+    width: 100%;
+    max-width: 440px;
+  }
+  .branch-box .branch-title {
+    font-family: 'IBM Plex Mono', monospace;
+    font-size: .67rem;
+    font-weight: 700;
+    color: var(--plum);
+    margin-bottom: 4px;
+  }
+  .branch-box .branch-body {
+    font-size: .67rem;
+    color: var(--ink2);
+  }
+  .branch-labels {
+    display: flex;
+    justify-content: space-between;
+    width: 100%;
+    max-width: 440px;
+    padding: 0 20px;
+    margin-top: 3px;
+    font-family: 'IBM Plex Mono', monospace;
+    font-size: .58rem;
+  }
+
+  .annot {
+    font-family: 'IBM Plex Mono', monospace;
+    font-size: .6rem;
+    color: var(--ink3);
+    font-style: italic;
+    margin: 3px 0;
+    text-align: center;
+  }
+
+  code {
+    font-family: 'IBM Plex Mono', monospace;
+    font-size: .62em;
+    background: rgba(0,0,0,.06);
+    padding: 1px 5px;
+    border-radius: 3px;
+  }
+
+  /* diff callout */
+  .diff-note {
+    border-left: 3px solid var(--amber);
+    background: var(--amber-lt);
+    padding: 8px 12px;
+    border-radius: 0 6px 6px 0;
+    font-size: .67rem;
+    color: var(--amber);
+    font-family: 'IBM Plex Mono', monospace;
+    width: 100%;
+    max-width: 600px;
+    margin: 6px 0;
+  }
+  .diff-note strong { font-weight: 700; }
+</style>
+</head>
+<body>
+
+<div class="header">
+  <div class="eyebrow">Algorithmic Flowchart</div>
+  <h1>Fused Multi-Channel <em>Temporal SLIC</em> on SEVIR</h1>
+  <div class="sub">visualize_slic_sevir.py &nbsp;·&nbsp; VIL + IR107 + IR069 + DEM &nbsp;·&nbsp; Master Boundaries · No Birth/Death · No RAG</div>
+  <div class="divider"></div>
+</div>
+
+<!-- LEGEND -->
+<div class="legend">
+  <div class="legend-item"><div class="legend-pip" style="background:var(--teal)"></div>Initialization / SLIC</div>
+  <div class="legend-item"><div class="legend-pip" style="background:var(--blue)"></div>Optical Flow & Advection</div>
+  <div class="legend-item"><div class="legend-pip" style="background:var(--olive)"></div>Gradient Watershed</div>
+  <div class="legend-item"><div class="legend-pip" style="background:var(--rose)"></div>Rendering</div>
+  <div class="legend-item"><div class="legend-pip" style="background:var(--plum)"></div>Decision / Branch</div>
+  <div class="legend-item"><div class="legend-pip" style="background:var(--border); border: 1.5px dashed #9a9088; border-radius:2px"></div>I/O</div>
+</div>
+
+<div class="chart">
+<div class="flat">
+
+  <!-- START -->
+  <div class="node n-io" style="max-width:360px; text-align:center;">
+    <div class="node-title">▶ START</div>
+    <div class="node-body"><code>__main__</code> entry point</div>
+  </div>
+  <div class="conn"><div class="vl"></div><div class="arr"></div></div>
+
+  <!-- LOAD CATALOG -->
+  <div class="node" style="max-width:440px; text-align:center;">
+    <div class="node-title" style="justify-content:center;">📂 Load Catalog CSV</div>
+    <div class="node-body"><code>CATALOG.csv</code> → event IDs, HDF5 file paths, geo extents &amp; timestamps</div>
+  </div>
+  <div class="conn"><div class="vl"></div><div class="arr"></div></div>
+
+  <div class="loop-pill">↻ INTERACTIVE EVENT LOOP</div>
+  <div class="conn"><div class="vl"></div><div class="arr"></div></div>
+
+  <!-- INPUT -->
+  <div class="node n-io" style="max-width:380px;">
+    <div class="node-title">⌨ User Input: Event ID</div>
+    <div class="node-body"><code>'q'</code> → quit. Empty → re-prompt.</div>
+  </div>
+  <div class="conn"><div class="vl"></div><div class="arr"></div></div>
+
+  <!-- ═══ PHASE 1 ═══ -->
+  <div class="phase-hdr" style="width:100%; max-width:960px;">
+    <span>① Data Loading &amp; Fusion</span>
+  </div>
+
+  <div class="grid-2" style="max-width:760px; align-self:center;">
+    <div class="node">
+      <div class="node-title">🛰 Load Satellite Channels</div>
+      <div class="node-body">
+        Per channel (VIL → IR107 → IR069):<br/>
+        • Resolve HDF5 path from catalog (filtered by <code>img_type</code>).<br/>
+        • Read raw array; fix axis order to <code>(T, H, W)</code>.<br/>
+        • Bicubic upsample to VIL's native resolution if needed.<br/>
+        • VIL loaded first → sets <code>tgt_shape (384×384)</code>.
+      </div>
+    </div>
+    <div class="node">
+      <div class="node-title">🏔 Fetch &amp; Re-grid DEM</div>
+      <div class="node-body">
+        Check <code>_dem_cache</code> first.<br/>
+        Query Copernicus DEM-30 via STAC + Planetary Computer.<br/>
+        Parallel tile download (ThreadPoolExecutor, ≤8 workers).<br/>
+        Merge tiles → bilinear interpolate to SEVIR Lambert-Conformal grid.<br/>
+        Result: <code>dem_raw (H, W)</code> → normalize → <code>dem_norm ∈ [0,1]</code>.
+      </div>
+    </div>
+  </div>
+
+  <div class="conn"><div class="vl"></div><div class="arr"></div></div>
+
+  <div class="node n-teal" style="max-width:580px; text-align:center;">
+    <div class="node-title" style="justify-content:center;">Build Fused Feature Cube</div>
+    <div class="node-body">
+      For each channel in <code>FUSION_CHANNELS</code> = [VIL, IR107, IR069]:<br/>
+      normalize <code>(arr − min) / (max − min + ε)</code> → stack along last axis.<br/>
+      Output: <code>fused (T, H, W, C)</code> float32 &nbsp;·&nbsp; raw <code>data {ch: (T,H,W)}</code> kept for display colourmap.
+    </div>
+  </div>
+
+  <div class="conn"><div class="vl"></div><div class="arr"></div></div>
+
+  <!-- ═══ PHASE 2 ═══ -->
+  <div class="phase-hdr" style="width:100%; max-width:960px;">
+    <span>② Pre-computation — Both Segmentation Modes</span>
+  </div>
+
+  <div class="loop-pill">↻ FOR EACH MODE: [Temporal SLIC (use_flow=True), Standard SLIC (use_flow=False)]</div>
+  <div class="conn"><div class="vl"></div><div class="arr"></div></div>
+
+  <div class="node n-teal" style="max-width:560px; text-align:center;">
+    <div class="node-title" style="justify-content:center;">Instantiate <code>TemporalSLIC_DEM</code></div>
+    <div class="node-body">
+      Params: <code>n_segments=1500</code>, <code>compactness=10.0</code>, <code>λ_z=0.5</code>.<br/>
+      State: <code>prev_labels = prev_centroids = prev_gray = None</code>.<br/>
+      DEM stored as <code>dem_norm</code> (for SLIC channel) and <code>dem_weighted = dem_norm × λ_z</code> (for gradient).
+    </div>
+  </div>
+  <div class="conn"><div class="vl"></div><div class="arr"></div></div>
+
+  <div class="loop-pill">↻ FOR EACH FRAME t = 0 … T−1 &nbsp;(calls tslic.segment(fused[t], use_flow))</div>
+  <div class="conn"><div class="vl"></div><div class="arr"></div></div>
+
+  <!-- PREP INSIDE SEGMENT -->
+  <div class="node" style="max-width:560px; text-align:center;">
+    <div class="node-title" style="justify-content:center;">Frame-Level Preparation</div>
+    <div class="node-body">
+      • Ensure input is <code>(H, W, C)</code> (expand dim if 2-D single channel).<br/>
+      • <b>VIL proxy</b>: <code>curr_gray = (fused[:,:,0] × 255).astype(uint8)</code> for Farneback.<br/>
+      • Append DEM channel: <code>feature_cube (H,W,C+1)</code> = concat[fused, dem_norm×λ_z].
+    </div>
+  </div>
+  <div class="conn"><div class="vl"></div><div class="arr"></div></div>
+
+  <!-- BRANCH: FRAME 0? -->
+  <div class="branch-box">
+    <div class="branch-title">◈ BRANCH — Is this Frame 0?</div>
+    <div class="branch-body"><code>prev_labels is None</code></div>
+  </div>
+  <div class="branch-labels" style="max-width:440px; align-self:center;">
+    <span style="color:var(--teal); font-family:'IBM Plex Mono',monospace; font-size:.6rem;">YES (Frame 0)</span>
+    <span style="color:var(--blue); font-family:'IBM Plex Mono',monospace; font-size:.6rem;">NO (Frame t+)</span>
+  </div>
+
+  <div class="grid-2" style="max-width:840px; align-self:center; margin-top:4px;">
+
+    <!-- FRAME 0 PATH -->
+    <div class="sub-col">
+      <div class="node n-teal">
+        <div class="node-title"><span class="badge badge-1">Init</span> Multi-Channel SLIC</div>
+        <div class="node-body">
+          Input: <code>feature_cube (H, W, C+1)</code> — satellite channels + DEM.<br/>
+          <code>skimage.slic(feature_cube, n_segments=1500, compactness=10,</code><br/>
+          <code>&nbsp;&nbsp;enforce_connectivity=True, channel_axis=-1)</code><br/>
+          Clusters in <b>(C+1)-D spectral + 2-D spatial</b> space.<br/>
+          Output: <code>labels (H, W) int32</code>, starting at 1.
+        </div>
+      </div>
+      <div class="node n-teal">
+        <div class="node-title"><span class="badge badge-1">Init</span> Compute Initial Centroids</div>
+        <div class="node-body">
+          <code>scipy.ndimage.center_of_mass</code> per unique label.<br/>
+          Store: <code>prev_centroids = {lbl: [y, x]}</code>.<br/>
+          (No flow computed — returns zero flow array.)
+        </div>
+      </div>
+    </div>
+
+    <!-- FRAME t+ PATH -->
+    <div class="sub-col">
+      <div class="node n-blue">
+        <div class="node-title"><span class="badge badge-2">Step 1</span> Dense Optical Flow</div>
+        <div class="node-body">
+          <b>if use_flow (Temporal mode):</b><br/>
+          <code>cv2.calcOpticalFlowFarneback(prev_gray, curr_gray, ...)</code><br/>
+          pyramid: 3 levels, win=15, poly_n=5, σ=1.2.<br/>
+          Output: <code>flow (H, W, 2)</code> pixel displacements.<br/>
+          <b>else (Standard mode):</b> flow stays zeros.
+        </div>
+      </div>
+      <div class="node n-blue">
+        <div class="node-title"><span class="badge badge-2">Step 2</span> Advect Centroids (Lagrangian)</div>
+        <div class="node-body">
+          For each <code>(lbl, [y_old, x_old])</code>:<br/>
+          • Average flow over <code>10×10</code> pixel window centred at <code>(y_old, x_old)</code>.<br/>
+          • <code>y_new = clip(y_old + mean_flow_y, 0, H-1)</code>.<br/>
+          • Place marker: <code>advected_markers[y_new, x_new] = lbl</code>.
+        </div>
+      </div>
+      <div class="node n-olive">
+        <div class="node-title"><span class="badge badge-3">Step 3</span> Fused Gradient</div>
+        <div class="node-body">
+          Per channel c: <code>sobel(fused_curr[:,:,c])</code>.<br/>
+          Also: <code>sobel(dem_weighted)</code>.<br/>
+          <code>combined_gradient = pixel-wise MAX</code> across all layers.<br/>
+          Boundaries snap to the <b>sharpest edge in ANY spectral band</b>.
+        </div>
+      </div>
+      <div class="node n-olive">
+        <div class="node-title"><span class="badge badge-3">Step 4</span> Compact Watershed</div>
+        <div class="node-body">
+          <code>skimage.watershed(combined_gradient, markers=advected_markers,</code><br/>
+          <code>&nbsp;&nbsp;compactness=0.10)</code>.<br/>
+          Each advected marker grows to nearest gradient ridge.<br/>
+          Output: <code>labels (H, W) int32</code>.
+        </div>
+      </div>
+      <div class="node n-blue">
+        <div class="node-title"><span class="badge badge-2">Step 5</span> Recompute Centroids</div>
+        <div class="node-body">
+          <code>self.prev_centroids = _calculate_centroids(labels)</code>.<br/>
+          Centers realigned to true region centroids of refined labels.
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <div class="conn"><div class="vl" style="height:18px;"></div><div class="arr"></div></div>
+
+  <!-- UPDATE STATE -->
+  <div class="node n-teal" style="max-width:540px; text-align:center;">
+    <div class="node-title" style="justify-content:center;">🔄 Update Lagrangian State</div>
+    <div class="node-body">
+      <code>prev_labels ← labels</code> &nbsp;·&nbsp; <code>prev_gray ← curr_gray</code>.<br/>
+      Append <code>labels</code>, <code>flow</code>, <code>prev_centroids</code> to per-mode lists.<br/>
+      Continue to next frame.
+    </div>
+  </div>
+
+  <div class="conn"><div class="vl"></div><div class="arr"></div></div>
+  <div class="annot">← end frame loop → end mode loop →</div>
+  <div class="conn"><div class="vl"></div><div class="arr"></div></div>
+
+  <!-- DIFF CALLOUT -->
+  <div class="diff-note" style="align-self:center;">
+    <strong>Key simplification vs. Adaptive Residual version:</strong>&nbsp;
+    No warp-and-residual step. No Birth/Death thresholding. No RAG construction.
+    Centroids are advected but never spawned or pruned — superpixel count is stable across frames.
+  </div>
+
+  <div class="conn"><div class="vl"></div><div class="arr"></div></div>
+
+  <!-- ═══ PHASE 3 ═══ -->
+  <div class="phase-hdr" style="width:100%; max-width:960px;">
+    <span>③ Boundary Rendering — Master Boundaries</span>
+  </div>
+
+  <div class="grid-3" style="align-self:center;">
+    <div class="node n-rose">
+      <div class="node-title">🎨 frame_to_rgb</div>
+      <div class="node-body">
+        Clip normalize raw frame to <code>[0,1]</code> using resolved <code>vmin/vmax</code>.<br/>
+        Apply per-channel colormap:<br/>
+        VIL → <code>jet</code> &nbsp;·&nbsp; IR → <code>gray_r</code>.<br/>
+        Output: <code>(H, W, 3) float32</code>.
+      </div>
+    </div>
+    <div class="node n-rose">
+      <div class="node-title">🖼 render_boundary</div>
+      <div class="node-body">
+        <code>skimage.mark_boundaries(rgb, labels, mode='thick')</code>.<br/>
+        <b>Gold</b> = Temporal SLIC.<br/>
+        <b>Cyan</b> = Standard SLIC.<br/>
+        Output: <code>(H, W, 3) uint8</code>.
+      </div>
+    </div>
+    <div class="node n-rose">
+      <div class="node-title">💾 Stack Rendered Frames</div>
+      <div class="node-body">
+        <b>One label map per frame</b>, rendered onto <b>all display channels</b> (VIL, IR107, IR069).<br/>
+        <code>rendered_store[ch][use_flow]</code><br/>
+        shape: <code>(T, H, W, 3) uint8</code>.
+      </div>
+    </div>
+  </div>
+
+  <div class="conn"><div class="vl"></div><div class="arr"></div></div>
+
+  <!-- ═══ PHASE 4 ═══ -->
+  <div class="phase-hdr" style="width:100%; max-width:960px;">
+    <span>④ Animation — 2 × N Grid (per frame update)</span>
+  </div>
+
+  <div class="grid-4" style="align-self:center;">
+    <div class="node">
+      <div class="node-title">📐 Layout</div>
+      <div class="node-body">
+        <code>2 rows × N_cols</code> matplotlib grid.<br/>
+        Row 0 = Temporal SLIC (gold).<br/>
+        Row 1 = Standard SLIC (cyan).<br/>
+        N = available display channels.
+      </div>
+    </div>
+    <div class="node">
+      <div class="node-title">🖼 Swap Frame Image</div>
+      <div class="node-body">
+        <code>im.set_data(rendered_store[ch][use_flow][t_safe])</code>.<br/>
+        Fast pixel-swap per artist — no redraw.
+      </div>
+    </div>
+    <div class="node">
+      <div class="node-title">📍 Centroid Scatter</div>
+      <div class="node-body">
+        Remove old scatter artist, draw new one.<br/>
+        <b>Red</b> = Temporal &nbsp;·&nbsp; <b>White</b> = Standard.<br/>
+        Size s=6, no edge width.
+      </div>
+    </div>
+    <div class="node">
+      <div class="node-title">➤ Flow Quiver</div>
+      <div class="node-body">
+        Temporal row only.<br/>
+        Subsample every <code>24px</code>.<br/>
+        Show arrows where <code>|flow| &gt; 0.5px</code>.<br/>
+        White, α=0.55, scale=120.
+      </div>
+    </div>
+  </div>
+
+  <div class="conn"><div class="vl"></div><div class="arr"></div></div>
+
+  <!-- WRITER -->
+  <div class="node" style="max-width:500px; text-align:center;">
+    <div class="node-title" style="justify-content:center;">💿 Select Writer &amp; Save</div>
+    <div class="node-body">
+      <b>ffmpeg found?</b> → <code>.mp4</code> (FFMpegWriter, 5 fps, 2000 kbps, dpi=120).<br/>
+      <b>Otherwise:</b> → <code>.gif</code> (PillowWriter, 5 fps, dpi=80).<br/>
+      Output: <code>EVENTS_DIR/{event_id}_slic_1500.{ext}</code>
+    </div>
+  </div>
+
+  <div class="conn"><div class="vl"></div><div class="arr"></div></div>
+
+  <!-- DONE -->
+  <div class="node n-io" style="max-width:420px;">
+    <div class="node-title">✅ Output path printed → next Event ID or quit</div>
+  </div>
+  <div class="conn"><div class="vl" style="height:18px;"></div><div class="arr"></div></div>
+
+  <!-- END -->
+  <div class="node n-io" style="max-width:360px;">
+    <div class="node-title">⏹ END</div>
+  </div>
+
+</div><!-- /flat -->
+</div><!-- /chart -->
+
+<!-- FOOTER -->
+<div style="text-align:center; margin-top:50px; font-family:'IBM Plex Mono',monospace; font-size:.62rem; color:var(--ink3); line-height:2.2; border-top:1px solid var(--border); padding-top:20px; max-width:900px; margin-left:auto; margin-right:auto;">
+  <span style="color:var(--teal);">Teal — SLIC / Initialization</span>
+  &nbsp;·&nbsp;
+  <span style="color:var(--blue);">Blue — Optical Flow & Advection</span>
+  &nbsp;·&nbsp;
+  <span style="color:var(--olive);">Olive — Gradient Watershed</span>
+  &nbsp;·&nbsp;
+  <span style="color:var(--rose);">Rose — Rendering</span>
+  <br/>
+  Master Boundary concept: one label map from the fused cube is rendered identically onto all display channels (VIL, IR107, IR069) per frame.
+</div>
+
+</body>
+</html>

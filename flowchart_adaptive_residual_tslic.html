@@ -1,0 +1,723 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8"/>
+<meta name="viewport" content="width=device-width, initial-scale=1.0"/>
+<title>Adaptive Residual TSLIC — Flowchart</title>
+<link href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;600;700&family=Sora:wght@300;400;600;700&display=swap" rel="stylesheet"/>
+<style>
+  :root {
+    --bg: #080c14;
+    --panel: #0e1522;
+    --border: #1c2a40;
+    --gold: #f4a62a;
+    --cyan: #00d4e8;
+    --green: #3cefb0;
+    --red: #ff4d6d;
+    --purple: #9b72ff;
+    --dim: #4a6080;
+    --text: #c8d8ec;
+    --textdim: #5a7090;
+  }
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+  body {
+    background: var(--bg);
+    font-family: 'Sora', sans-serif;
+    color: var(--text);
+    min-height: 100vh;
+    padding: 40px 20px 60px;
+  }
+
+  /* ─── HEADER ─── */
+  .header {
+    text-align: center;
+    margin-bottom: 50px;
+  }
+  .header h1 {
+    font-size: 1.55rem;
+    font-weight: 700;
+    letter-spacing: .04em;
+    color: #fff;
+    margin-bottom: 6px;
+  }
+  .header h1 span { color: var(--gold); }
+  .header p {
+    font-size: .78rem;
+    color: var(--textdim);
+    font-family: 'JetBrains Mono', monospace;
+    letter-spacing: .08em;
+  }
+
+  /* ─── LEGEND ─── */
+  .legend {
+    display: flex;
+    gap: 22px;
+    justify-content: center;
+    flex-wrap: wrap;
+    margin-bottom: 44px;
+    font-family: 'JetBrains Mono', monospace;
+    font-size: .7rem;
+  }
+  .legend-item {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    color: var(--textdim);
+  }
+  .legend-dot {
+    width: 12px; height: 12px;
+    border-radius: 2px;
+    flex-shrink: 0;
+  }
+
+  /* ─── CHART WRAPPER ─── */
+  .chart {
+    max-width: 1080px;
+    margin: 0 auto;
+    position: relative;
+  }
+
+  /* ─── SVG connector layer ─── */
+  .connector-svg {
+    position: absolute;
+    top: 0; left: 0;
+    width: 100%; height: 100%;
+    pointer-events: none;
+    z-index: 0;
+  }
+
+  /* ─── COLUMNS ─── */
+  .columns {
+    display: grid;
+    grid-template-columns: 1fr 1fr 1fr;
+    gap: 0 18px;
+    position: relative;
+    z-index: 1;
+  }
+
+  .col {
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    gap: 0;
+  }
+  .col-label {
+    font-family: 'JetBrains Mono', monospace;
+    font-size: .65rem;
+    font-weight: 700;
+    letter-spacing: .14em;
+    text-transform: uppercase;
+    padding: 5px 14px;
+    border-radius: 4px;
+    margin-bottom: 18px;
+    border: 1px solid;
+  }
+
+  /* ─── NODE BASE ─── */
+  .node {
+    border-radius: 8px;
+    padding: 11px 14px;
+    font-size: .72rem;
+    line-height: 1.5;
+    width: 100%;
+    max-width: 300px;
+    position: relative;
+    border: 1.5px solid;
+    transition: transform .15s, box-shadow .15s;
+    cursor: default;
+  }
+  .node:hover {
+    transform: translateY(-2px);
+    box-shadow: 0 8px 24px rgba(0,0,0,.5);
+  }
+  .node .node-title {
+    font-weight: 700;
+    font-size: .7rem;
+    font-family: 'JetBrains Mono', monospace;
+    letter-spacing: .06em;
+    margin-bottom: 4px;
+    display: flex;
+    align-items: center;
+    gap: 7px;
+  }
+  .node .node-body {
+    color: var(--textdim);
+    font-size: .67rem;
+    line-height: 1.55;
+  }
+  .node .badge {
+    font-family: 'JetBrains Mono', monospace;
+    font-size: .55rem;
+    font-weight: 700;
+    padding: 2px 6px;
+    border-radius: 3px;
+    letter-spacing: .1em;
+    text-transform: uppercase;
+  }
+
+  /* ─── NODE THEMES ─── */
+  .node-io {
+    background: #0a1018;
+    border-color: var(--dim);
+    border-style: dashed;
+  }
+  .node-io .node-title { color: var(--text); }
+
+  .node-init {
+    background: #0c1220;
+    border-color: var(--cyan);
+    box-shadow: 0 0 12px rgba(0,212,232,.08);
+  }
+  .node-init .node-title { color: var(--cyan); }
+
+  .node-flow {
+    background: #0f1325;
+    border-color: var(--purple);
+    box-shadow: 0 0 12px rgba(155,114,255,.08);
+  }
+  .node-flow .node-title { color: var(--purple); }
+
+  .node-birth-death {
+    background: #12100c;
+    border-color: var(--gold);
+    box-shadow: 0 0 12px rgba(244,166,42,.08);
+  }
+  .node-birth-death .node-title { color: var(--gold); }
+
+  .node-refine {
+    background: #0c1a14;
+    border-color: var(--green);
+    box-shadow: 0 0 12px rgba(60,239,176,.08);
+  }
+  .node-refine .node-title { color: var(--green); }
+
+  .node-rag {
+    background: #18100f;
+    border-color: var(--red);
+    box-shadow: 0 0 12px rgba(255,77,109,.08);
+  }
+  .node-rag .node-title { color: var(--red); }
+
+  .node-render {
+    background: #0f110c;
+    border-color: #8bc34a;
+    box-shadow: 0 0 12px rgba(139,195,74,.06);
+  }
+  .node-render .node-title { color: #8bc34a; }
+
+  .node-out {
+    background: #070a10;
+    border-color: var(--dim);
+    border-style: dashed;
+  }
+  .node-out .node-title { color: var(--textdim); }
+
+  .node-decision {
+    background: #110d1e;
+    border-color: var(--purple);
+    clip-path: polygon(50% 0%, 100% 50%, 50% 100%, 0% 50%);
+    padding: 24px 30px;
+    text-align: center;
+    border-radius: 0;
+    border-width: 1.5px;
+  }
+  .node-decision .node-title { justify-content: center; font-size: .65rem; }
+  .node-decision .node-body { text-align: center; }
+
+  /* ─── CONNECTORS (vertical spacers that show as lines via border) ─── */
+  .vline {
+    width: 1.5px;
+    background: linear-gradient(to bottom, var(--border), var(--border));
+    flex-shrink: 0;
+    align-self: center;
+  }
+  .arrow {
+    width: 0; height: 0;
+    border-left: 5px solid transparent;
+    border-right: 5px solid transparent;
+    border-top: 7px solid;
+    align-self: center;
+    flex-shrink: 0;
+  }
+
+  /* ─── SPACER ─── */
+  .spacer { height: 10px; }
+  .spacer-lg { height: 20px; }
+
+  /* ─── LOOP BRACKET ─── */
+  .loop-label {
+    font-family: 'JetBrains Mono', monospace;
+    font-size: .6rem;
+    color: var(--textdim);
+    letter-spacing: .1em;
+    text-transform: uppercase;
+    padding: 3px 10px;
+    border: 1px solid var(--border);
+    border-radius: 20px;
+    background: var(--panel);
+    white-space: nowrap;
+    align-self: center;
+    margin: 6px 0;
+  }
+
+  /* ─── SECTION LABELS ─── */
+  .section-tag {
+    font-family: 'JetBrains Mono', monospace;
+    font-size: .58rem;
+    font-weight: 700;
+    text-transform: uppercase;
+    letter-spacing: .14em;
+    padding: 2px 8px;
+    border-radius: 3px;
+    margin-bottom: 8px;
+    align-self: flex-start;
+  }
+
+  /* ─── FULL-WIDTH NODES ─── */
+  .full-row {
+    grid-column: 1 / -1;
+    display: flex;
+    justify-content: center;
+    position: relative;
+  }
+  .full-row .node { max-width: 520px; }
+
+  /* ─── STEP CONNECTOR ─── */
+  .step-connector {
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    width: 100%;
+  }
+  .step-connector .vl {
+    width: 1.5px;
+    height: 14px;
+    background: var(--border);
+  }
+  .step-connector .arr {
+    width: 0; height: 0;
+    border-left: 4px solid transparent;
+    border-right: 4px solid transparent;
+    border-top: 6px solid var(--dim);
+  }
+
+  /* ─── THREE-COL SECTION ─── */
+  .three-col-section {
+    grid-column: 1 / -1;
+  }
+
+  .phase-header {
+    text-align: center;
+    margin-bottom: 16px;
+  }
+  .phase-header .phase-title {
+    display: inline-block;
+    font-family: 'JetBrains Mono', monospace;
+    font-size: .65rem;
+    font-weight: 700;
+    letter-spacing: .14em;
+    text-transform: uppercase;
+    padding: 5px 18px;
+    border-radius: 4px;
+    border: 1px solid var(--border);
+    background: var(--panel);
+    color: var(--textdim);
+  }
+
+  .three-cols {
+    display: grid;
+    grid-template-columns: 1fr 1fr 1fr;
+    gap: 12px;
+  }
+
+  .sub-col {
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    gap: 8px;
+  }
+
+  /* ─── ANNOTATION LINES ─── */
+  .annot {
+    font-size: .6rem;
+    color: var(--textdim);
+    font-family: 'JetBrains Mono', monospace;
+    text-align: center;
+    margin: 2px 0;
+    font-style: italic;
+  }
+
+  /* ─── FLAT LAYOUT ─── */
+  .flat {
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    gap: 0;
+    width: 100%;
+  }
+
+  code {
+    font-family: 'JetBrains Mono', monospace;
+    font-size: .62em;
+    background: rgba(255,255,255,.05);
+    padding: 1px 5px;
+    border-radius: 3px;
+  }
+
+  .tag-a { background: rgba(155,114,255,.15); color: var(--purple); }
+  .tag-b { background: rgba(244,166,42,.15);  color: var(--gold); }
+  .tag-c { background: rgba(60,239,176,.15);  color: var(--green); }
+  .tag-d { background: rgba(255,77,109,.15);  color: var(--red); }
+
+  /* highlight on hover for linked nodes */
+  .hl-cyan  { border-color: var(--cyan) !important; }
+  .hl-gold  { border-color: var(--gold) !important; }
+
+  /* ─── SIDE ANNOTATIONS (arrows label) ─── */
+  .side-note {
+    position: absolute;
+    font-family: 'JetBrains Mono', monospace;
+    font-size: .58rem;
+    color: var(--dim);
+    white-space: nowrap;
+  }
+</style>
+</head>
+<body>
+
+<div class="header">
+  <h1>Adaptive Residual Temporal SLIC — <span>Algorithmic Flowchart</span></h1>
+  <p>SEVIR · VIL + IR107 + IR069 + DEM · Birth/Death · Optical Flow · Watershed · RAG</p>
+</div>
+
+<!-- LEGEND -->
+<div class="legend">
+  <div class="legend-item"><div class="legend-dot" style="background:var(--cyan)"></div>Initialization / SLIC</div>
+  <div class="legend-item"><div class="legend-dot" style="background:var(--purple)"></div>Optical Flow</div>
+  <div class="legend-item"><div class="legend-dot" style="background:var(--gold)"></div>Birth / Death</div>
+  <div class="legend-item"><div class="legend-dot" style="background:var(--green)"></div>Watershed Refinement</div>
+  <div class="legend-item"><div class="legend-dot" style="background:var(--red)"></div>RAG Construction</div>
+  <div class="legend-item"><div class="legend-dot" style="background:#8bc34a"></div>Rendering</div>
+  <div class="legend-item"><div class="legend-dot" style="background:var(--dim); border: 1px dashed #4a6080"></div>I/O</div>
+</div>
+
+<!-- ═══════════════════════════════════ CHART ═══════════════════════════════════ -->
+<div class="chart">
+<div class="flat">
+
+  <!-- START -->
+  <div class="node node-io" style="max-width:380px; text-align:center; border-radius:40px;">
+    <div class="node-title" style="justify-content:center;">▶ START</div>
+    <div class="node-body">Script invoked from <code>__main__</code></div>
+  </div>
+  <div class="step-connector"><div class="vl"></div><div class="arr"></div></div>
+
+  <!-- LOAD CATALOG -->
+  <div class="node node-io" style="max-width:420px; text-align:center;">
+    <div class="node-title" style="justify-content:center;">📂 Load Catalog CSV</div>
+    <div class="node-body">Parse <code>CATALOG.csv</code> — event IDs, file paths, geospatial extents, timestamps</div>
+  </div>
+  <div class="step-connector"><div class="vl"></div><div class="arr"></div></div>
+
+  <!-- EVENT LOOP -->
+  <div class="loop-label">↻ INTERACTIVE EVENT LOOP</div>
+  <div class="step-connector"><div class="vl"></div><div class="arr"></div></div>
+
+  <!-- INPUT -->
+  <div class="node node-io" style="max-width:420px; text-align:center;">
+    <div class="node-title" style="justify-content:center;">⌨ User Input: Event ID</div>
+    <div class="node-body">Prompt for event ID. <code>'q'</code> → exit loop.</div>
+  </div>
+  <div class="step-connector"><div class="vl"></div><div class="arr"></div></div>
+
+  <!-- ════════ DATA LOADING ════════ -->
+  <div class="phase-header" style="width:100%">
+    <span class="phase-title">① DATA LOADING &amp; FUSION</span>
+  </div>
+  <div style="display:grid; grid-template-columns:1fr 1fr; gap:12px; width:100%; max-width:700px; margin-bottom:0;">
+    <div class="node node-io">
+      <div class="node-title">🛰 Load Satellite Channels</div>
+      <div class="node-body">
+        Read <code>VIL</code>, <code>IR107</code>, <code>IR069</code> from HDF5 files.<br/>
+        Resize all to target shape <code>384×384</code>.<br/>
+        Transpose if needed → <code>(T, H, W)</code> per channel.
+      </div>
+    </div>
+    <div class="node node-io">
+      <div class="node-title">🏔 Fetch &amp; Re-grid DEM</div>
+      <div class="node-body">
+        Query Copernicus DEM tiles via STAC API.<br/>
+        Parallel download → merge → bilinear interpolate to SEVIR Lambert-Conformal grid.<br/>
+        Cached by extent key.
+      </div>
+    </div>
+  </div>
+  <div class="step-connector"><div class="vl"></div><div class="arr"></div></div>
+
+  <div class="node node-init" style="max-width:520px; text-align:center;">
+    <div class="node-title" style="justify-content:center;">Build Fused Feature Cube</div>
+    <div class="node-body">
+      Normalize each channel to <code>[0, 1]</code>. Stack along last axis.<br/>
+      <code>fused: (T, H, W, C)</code> — C = {VIL, IR107, IR069} available channels.<br/>
+      DEM normalized separately → <code>dem_norm (H, W)</code>.
+    </div>
+  </div>
+  <div class="step-connector"><div class="vl"></div><div class="arr"></div></div>
+
+  <!-- ════════ PRECOMPUTE ════════ -->
+  <div class="phase-header" style="width:100%">
+    <span class="phase-title">② PRE-COMPUTATION — Both Segmentation Modes</span>
+  </div>
+  <div class="loop-label">↻ FOR EACH MODE: [Adaptive TSLIC (use_flow=True), Standard SLIC (use_flow=False)]</div>
+  <div class="step-connector"><div class="vl"></div><div class="arr"></div></div>
+
+  <div class="node node-init" style="max-width:520px; text-align:center;">
+    <div class="node-title" style="justify-content:center;">Instantiate <code>AdaptiveResidualTSLIC_DEM</code></div>
+    <div class="node-body">
+      Params: <code>n_segments=1500</code>, <code>compactness=10</code>, <code>λ_z=0.5</code>,<br/>
+      <code>thresh_death=0.05</code>, <code>thresh_birth=0.15</code>, <code>min_spacing=20</code>.<br/>
+      Lagrangian state: <code>prev_labels, prev_centers, prev_fused, prev_gray = None</code>
+    </div>
+  </div>
+  <div class="step-connector"><div class="vl"></div><div class="arr"></div></div>
+
+  <div class="loop-label">↻ FOR EACH FRAME t = 0 … T−1</div>
+  <div class="step-connector"><div class="vl"></div><div class="arr"></div></div>
+
+  <!-- DECISION: FRAME 0? -->
+  <div style="position:relative; display:flex; flex-direction:column; align-items:center; width:100%; max-width:460px;">
+    <div style="background:#110d1e; border:1.5px solid var(--purple); padding:16px 28px; transform:perspective(800px) rotateX(1deg); border-radius:6px; width:100%; text-align:center;">
+      <div class="node-title" style="justify-content:center; color:var(--purple); font-family:'JetBrains Mono',monospace; font-size:.7rem;">◈ BRANCH: Is this Frame 0?</div>
+      <div class="node-body" style="text-align:center;">(<code>prev_labels is None</code>)</div>
+    </div>
+    <!-- branch labels -->
+    <div style="display:flex; width:100%; justify-content:space-between; padding:0 12px; margin-top:8px;">
+      <span style="font-family:'JetBrains Mono',monospace;font-size:.6rem;color:var(--cyan);">YES →</span>
+      <span style="font-family:'JetBrains Mono',monospace;font-size:.6rem;color:var(--gold);">NO →</span>
+    </div>
+  </div>
+
+  <!-- FRAME 0 vs FRAME t+ paths -->
+  <div style="display:grid; grid-template-columns:1fr 1fr; gap:18px; width:100%; max-width:800px; margin-top:4px;">
+
+    <!-- LEFT: Frame 0 -->
+    <div class="sub-col">
+      <div class="section-tag tag-a" style="align-self:center;">Frame 0 — Initialization</div>
+      <div class="node node-init" style="width:100%;">
+        <div class="node-title">🔵 Multi-Channel SLIC</div>
+        <div class="node-body">
+          Append DEM as extra channel → <code>(H,W,C+1)</code> feature cube.<br/>
+          <code>skimage.slic(feature_cube, n_segments=1500, compactness=10, enforce_connectivity=True)</code><br/>
+          Outputs label map <code>(H,W) int32</code>.
+        </div>
+      </div>
+      <div class="step-connector"><div class="vl"></div><div class="arr"></div></div>
+      <div class="node node-init" style="width:100%;">
+        <div class="node-title">📍 Compute Initial Centers</div>
+        <div class="node-body">
+          <code>center_of_mass</code> per unique label.<br/>
+          Store <code>prev_centers (K,2)</code>, <code>prev_labels</code>, <code>prev_fused</code>, <code>prev_gray</code>.
+        </div>
+      </div>
+      <div class="step-connector"><div class="vl"></div><div class="arr"></div></div>
+      <div class="node node-rag" style="width:100%;">
+        <div class="node-title">🕸 Build RAG</div>
+        <div class="node-body">
+          Scan horizontal + vertical pixel adjacencies.<br/>
+          Node features: mean fused vector per superpixel.<br/>
+          Edge weight: Euclidean feature distance.
+        </div>
+      </div>
+    </div>
+
+    <!-- RIGHT: Frame t+ Adaptive Update -->
+    <div class="sub-col">
+      <div class="section-tag tag-b" style="align-self:center;">Frame t+ — Adaptive Update</div>
+
+      <!-- STEP A -->
+      <div class="node node-flow" style="width:100%;">
+        <div class="node-title"><span class="badge tag-a">A</span> Dense Optical Flow</div>
+        <div class="node-body">
+          <b>if use_flow:</b> <code>cv2.calcOpticalFlowFarneback</code> on VIL uint8 proxy.<br/>
+          Output: <code>flow (H,W,2)</code> — pixel displacement field.
+        </div>
+      </div>
+      <div class="step-connector"><div class="vl"></div><div class="arr"></div></div>
+
+      <div class="node node-flow" style="width:100%;">
+        <div class="node-title"><span class="badge tag-a">A</span> Advect Centers</div>
+        <div class="node-body">
+          For each superpixel k: compute <b>mean flow</b> over all its member pixels.<br/>
+          <code>y_new = y_old + mean_fy</code>, clipped to <code>[0, H-1]</code>.<br/>
+          <em>Key distinction: member-mean flow vs. centroid-point flow.</em>
+        </div>
+      </div>
+      <div class="step-connector"><div class="vl"></div><div class="arr"></div></div>
+
+      <!-- STEP B -->
+      <div class="node node-flow" style="width:100%;">
+        <div class="node-title"><span class="badge tag-b">B</span> Warp &amp; Residual</div>
+        <div class="node-body">
+          Inverse-warp <code>prev_fused</code> using flow → <code>pred_fused (H,W,C)</code>.<br/>
+          <code>residual = max|fused_curr − pred_fused|</code> across channels.<br/>
+          High residual ⇒ unexpected atmospheric change.
+        </div>
+      </div>
+      <div class="step-connector"><div class="vl"></div><div class="arr"></div></div>
+
+      <div class="node node-birth-death" style="width:100%;">
+        <div class="node-title"><span class="badge tag-b">B</span> ☠ Death Filter</div>
+        <div class="node-body">
+          For each advected center <code>(cy, cx)</code>:<br/>
+          if <code>max(fused_curr[cy,cx,:]) &lt; thresh_death (0.05)</code> → remove.<br/>
+          Kills superpixels in dissipated / empty space.
+        </div>
+      </div>
+      <div class="step-connector"><div class="vl"></div><div class="arr"></div></div>
+
+      <div class="node node-birth-death" style="width:100%;">
+        <div class="node-title"><span class="badge tag-b">B</span> 🌱 Birth Seeding</div>
+        <div class="node-body">
+          Threshold residual map → binary mask (<code>&gt;0.15</code>).<br/>
+          Label connected components (blobs).<br/>
+          For each blob centroid: seed new center only if distance to all existing centers <code>≥ MIN_SPACING (20px)</code> and blob intensity <code>≥ thresh_death</code>.
+        </div>
+      </div>
+      <div class="step-connector"><div class="vl"></div><div class="arr"></div></div>
+
+      <!-- STEP C -->
+      <div class="node node-refine" style="width:100%;">
+        <div class="node-title"><span class="badge tag-c">C</span> Watershed Refinement</div>
+        <div class="node-body">
+          Place integer markers at each adaptive center.<br/>
+          Gradient = pixel-wise max of per-channel Sobel + DEM Sobel.<br/>
+          <code>skimage.watershed(combined_grad, markers, compactness=0.1)</code>.<br/>
+          Vectorised "Constrained SLIC" — no pixel-loop K-means needed.
+        </div>
+      </div>
+      <div class="step-connector"><div class="vl"></div><div class="arr"></div></div>
+
+      <div class="node node-refine" style="width:100%;">
+        <div class="node-title"><span class="badge tag-c">C</span> Recompute True Centroids</div>
+        <div class="node-body">
+          Update <code>prev_centers</code> from refined label map via <code>center_of_mass</code>.
+        </div>
+      </div>
+      <div class="step-connector"><div class="vl"></div><div class="arr"></div></div>
+
+      <!-- STEP D -->
+      <div class="node node-rag" style="width:100%;">
+        <div class="node-title"><span class="badge tag-d">D</span> Build RAG</div>
+        <div class="node-body">
+          Same as Frame 0 procedure.<br/>
+          Scan adjacencies → compute edge feature-distances.<br/>
+          Returns <code>{nodes, edges}</code>.
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <div class="step-connector" style="margin-top:8px;"><div class="vl" style="height:20px;"></div><div class="arr"></div></div>
+
+  <!-- UPDATE STATE -->
+  <div class="node node-init" style="max-width:540px; text-align:center;">
+    <div class="node-title" style="justify-content:center;">🔄 Update Lagrangian State</div>
+    <div class="node-body">
+      Store: <code>prev_labels ← labels</code>, <code>prev_fused ← fused_curr</code>, <code>prev_gray ← curr_gray</code>.<br/>
+      Append <code>labels, flow, rag</code> to per-mode lists. Continue to next frame.
+    </div>
+  </div>
+
+  <div class="step-connector"><div class="vl"></div><div class="arr"></div></div>
+  <div class="annot">← end of frame loop → end of mode loop →</div>
+  <div class="step-connector"><div class="vl"></div><div class="arr"></div></div>
+
+  <!-- ════════ RENDERING ════════ -->
+  <div class="phase-header" style="width:100%">
+    <span class="phase-title">③ BOUNDARY RENDERING</span>
+  </div>
+
+  <div style="display:grid; grid-template-columns:1fr 1fr 1fr; gap:12px; width:100%; max-width:900px; margin-bottom:0;">
+    <div class="node node-render">
+      <div class="node-title">🎨 frame_to_rgb</div>
+      <div class="node-body">
+        Normalize raw channel values to <code>[0,1]</code>.<br/>Apply colormap (jet / gray_r).<br/>Output <code>(H,W,3) float32</code>.
+      </div>
+    </div>
+    <div class="node node-render">
+      <div class="node-title">🖼 render_boundary</div>
+      <div class="node-body">
+        Overlay thick superpixel boundaries on RGB.<br/><b>Gold</b> = Adaptive TSLIC.<br/><b>Cyan</b> = Standard SLIC.
+      </div>
+    </div>
+    <div class="node node-render">
+      <div class="node-title">💾 Stack Rendered Frames</div>
+      <div class="node-body">
+        <code>rendered_store[ch][use_flow]</code><br/><code>shape: (T, H, W, 3) uint8</code>.<br/>One array per channel × mode.
+      </div>
+    </div>
+  </div>
+
+  <div class="step-connector"><div class="vl"></div><div class="arr"></div></div>
+
+  <!-- ════════ ANIMATION ════════ -->
+  <div class="phase-header" style="width:100%">
+    <span class="phase-title">④ ANIMATION — 2 × N Grid</span>
+  </div>
+
+  <div style="display:grid; grid-template-columns:1fr 1fr; gap:14px; width:100%; max-width:700px; margin-bottom:0;">
+    <div class="node node-out">
+      <div class="node-title">📐 Layout Setup</div>
+      <div class="node-body">
+        <code>2 rows × N_cols</code> grid (N = display channels).<br/>
+        Row 0 = Adaptive TSLIC (gold + RAG edges + quiver).<br/>
+        Row 1 = Standard SLIC (cyan boundaries).
+      </div>
+    </div>
+    <div class="node node-out">
+      <div class="node-title">▶ FuncAnimation per frame</div>
+      <div class="node-body">
+        Per frame: swap boundary image, scatter centroids, draw flow quiver (white arrows subsampled every 24px), overlay RAG edges as semi-transparent LineCollection.
+      </div>
+    </div>
+  </div>
+
+  <div class="step-connector"><div class="vl"></div><div class="arr"></div></div>
+
+  <!-- WRITER -->
+  <div class="node node-out" style="max-width:500px; text-align:center;">
+    <div class="node-title" style="justify-content:center;">💿 Select Writer &amp; Save</div>
+    <div class="node-body">
+      <b>ffmpeg available?</b> → <code>.mp4</code> (FFMpegWriter, 5 fps, 2000 kbps).<br/>
+      <b>No ffmpeg:</b> → <code>.gif</code> (PillowWriter, 5 fps).<br/>
+      Saved to <code>EVENTS_DIR/{event_id}_slic_1500.{ext}</code>
+    </div>
+  </div>
+
+  <div class="step-connector"><div class="vl"></div><div class="arr"></div></div>
+
+  <!-- DONE / LOOP -->
+  <div class="node node-io" style="max-width:400px; text-align:center; border-radius:40px; border-style:dashed;">
+    <div class="node-title" style="justify-content:center;">✅ Output path printed → next Event ID or quit</div>
+  </div>
+  <div class="step-connector"><div class="vl" style="height:20px;"></div><div class="arr"></div></div>
+
+  <!-- END -->
+  <div class="node node-io" style="max-width:380px; text-align:center; border-radius:40px;">
+    <div class="node-title" style="justify-content:center;">⏹ END</div>
+  </div>
+
+</div><!-- /flat -->
+</div><!-- /chart -->
+
+<!-- FOOTER NOTE -->
+<div style="text-align:center; margin-top:50px; font-family:'JetBrains Mono',monospace; font-size:.62rem; color:var(--dim); line-height:2; border-top:1px solid var(--border); padding-top:20px; max-width:900px; margin-left:auto; margin-right:auto;">
+  <span style="color:var(--purple);">A — Optical Flow (Farneback)</span> &nbsp;·&nbsp;
+  <span style="color:var(--gold);">B — Birth / Death</span> &nbsp;·&nbsp;
+  <span style="color:var(--green);">C — Watershed Refinement</span> &nbsp;·&nbsp;
+  <span style="color:var(--red);">D — RAG Construction</span><br/>
+  The Adaptive path (right branch) is skipped for Standard SLIC mode: centers stay grid-sampled per frame via plain SLIC without advection or birth/death.
+</div>
+
+</body>
+</html>

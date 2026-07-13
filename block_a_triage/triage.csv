@@ -1,0 +1,8 @@
+lifecycle_class,event_id,imex_converged,dopri5_converged,reaction_verdict,dopri5_verdict,diffusion_verdict,reaction_h_growth,reaction_dt_shrink,dopri5_h_growth,dopri5_dt_shrink,diffusion_h_growth,diffusion_dt_shrink,cfl_headroom_ratio
+RAPID_GROWTH,S830464,True,True,,,,,,,,,,0.2
+GROWTH_DECAY,S814242,True,True,,,,,,,,,,0.2
+EPISODIC,S838368,True,True,,,,,,,,,,0.2
+PLATEAU,S815466,True,True,,,,,,,,,,0.2
+RAPID_DECAY,S821019,True,True,,,,,,,,,,0.2
+STEADY,S831344,True,True,,,,,,,,,,0.2
+QUIESCENT,S834603,True,True,,,,,,,,,,0.2
