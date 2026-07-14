@@ -135,7 +135,7 @@ from scipy.sparse.linalg import eigsh
 from skimage.segmentation import slic as skimage_slic
 from skimage.segmentation import watershed
 from skimage.filters import sobel
-from scipy.ndimage import center_of_mass
+from scipy.ndimage import center_of_mass, binary_dilation
 from tqdm import tqdm
 
 warnings.filterwarnings("ignore", category=RuntimeWarning)
@@ -157,6 +157,27 @@ SUMMARY_CSV    = os.path.join(DATA_ROOT, "block_a_summary.csv")
 CALIB_JSON     = os.path.join(DATA_ROOT, "block_a_calibration.json")
 DEM_CACHE_DIR  = os.path.join(DATA_ROOT, "dem_cache")   # see load_dem_from_cache()
 
+# E_grid channels 2/3 (blocks.tex line 889, C_env=3: DEM_norm, CAPE_clim,
+# land_type_onehot_2bit). Both are STATIC, domain-wide precomputes — unlike
+# DEM (fetched lazily per-event-extent since GLO-30 tiles are cheap and
+# event-specific), CAPE climatology and MODIS land-cover are built ONCE,
+# offline, for the whole CONUS domain, then cropped per event at use time.
+# See build_era5_cape_climatology() / build_modis_landtype_grid() below —
+# run those once (like prefetch_dem.py) before the main sweep; the main
+# pipeline only ever READS from these caches, it does not fetch inline.
+CAPE_CACHE_DIR   = os.path.join(DATA_ROOT, "cape_cache")
+LANDTYPE_CACHE_DIR = os.path.join(DATA_ROOT, "landtype_cache")
+CAPE_YEAR        = 2019     # blocks.tex line 892: monthly-mean CAPE climatology
+CAPE_NORM_MAX    = 5000.0   # J/kg — normalisation ceiling; VERIFY against the
+                             # actual fetched climatology's percentiles before
+                             # trusting this (see build_era5_cape_climatology's
+                             # docstring — monthly-MEAN CAPE is typically far
+                             # below a single-storm extreme like 5000 J/kg, so
+                             # this may need lowering for usable dynamic range)
+# CONUS bounding box for the climatology/land-cover fetch (covers the SEVIR
+# domain with margin) — [lon_min, lon_max, lat_min, lat_max]
+CONUS_EXTENT     = [-125.0, -66.0, 24.0, 50.0]
+
 # N sweep — A.6: must include 500 (ISV elbow) and 1150 (global N*)
 N_VALUES           = [250, 500, 750, 1000, 1150, 1500]
 N_EVENTS_PER_CLASS = 5      # A.6: 5 events/class x 7 classes = 35 events total
@@ -169,7 +190,12 @@ LAMBDA_Z = 0.5   # Preliminary: DEM weighting, dem_weighted = dem_norm * lambda_
 DT_MACRO      = 300.0   # 5-minute macro step [seconds]
 N_MACRO_STEPS = 12      # 12 x 5 min = 60 min forecast horizon
 NODE_DIM      = 3       # [VIL, IR107, IR069]  — Preliminary channel order
-ENV_DIM       = 4       # [x/W, y/H, VIL, IR107]  — A.5 step 8
+# A.5 step 8 [x/W, y/H, VIL, IR107] (4) + E_grid's C_env=3 fields, expanded
+# to 4 dims since land_type is a 2-bit encoding (blocks.tex line 889):
+# [DEM_norm, CAPE_clim, land_bit1, land_bit0], where (land_bit1, land_bit0)
+# follows blocks.tex's own convention EXACTLY: ocean=(0,0), land=(1,0),
+# coastline=(0,1) -- see build_modis_landtype_grid's docstring. 4 + 4 = 8.
+ENV_DIM       = 8
 HIDDEN_DIM    = 64      # reaction MLP hidden size
 
 RTOL_DEFAULT = 1e-2   # blocks.tex A.3, line 222: "start at rtol=1e-2" — this
@@ -234,6 +260,7 @@ try:
     import planetary_computer
     import rioxarray
     from rioxarray.merge import merge_arrays
+    from rioxarray.exceptions import NoDataInBounds
     from scipy.interpolate import RegularGridInterpolator
 
     # Bottleneck/hang fix: GDAL's VSICURL layer has NO timeout by default,
@@ -824,6 +851,732 @@ def prefetch_dem_for_events(
 
 
 # ─────────────────────────────────────────────────────────────────────────────
+# CAPE CLIMATOLOGY  (blocks.tex line 889/892 — E_grid channel 2)
+#
+# "CAPE climatology is the monthly mean CAPE at the SEVIR domain (continental
+# US) from ERA5 reanalysis, downsampled to 384x384 ... static, no temporal
+# variation." Unlike DEM (fetched per-event-extent, since GLO-30 tiles are
+# cheap and event-specific), this is a ONE-TIME, whole-CONUS precompute: 12
+# monthly-mean grids, built once via build_era5_cape_climatology() (run this
+# the way you'd run prefetch_dem.py, before the main sweep — NOT inline per
+# event), then cropped+resampled per event by load_cape_for_event().
+#
+# HOW TO DOWNLOAD (one-time setup):
+#   1. Register a free account at https://cds.climate.copernicus.eu and
+#      accept the ERA5 licence (Copernicus dataset licence) on the
+#      "reanalysis-era5-single-levels" dataset page.
+#   2. Get your API key from your CDS profile page and put it in
+#      ~/.cdsapirc:
+#          url: https://cds.climate.copernicus.eu/api
+#          key: <your-personal-access-token>
+#   3. pip install cdsapi
+#   4. Run: python -c "import block_a_solver_benchmark as ba; \
+#            ba.build_era5_cape_climatology(2019)"
+#      This issues 12 CDS retrieve() requests (one per month), each
+#      averaging hourly 'convective_available_potential_energy' over that
+#      month for CONUS_EXTENT. CDS requests are QUEUED server-side and can
+#      take anywhere from minutes to an hour+ per request depending on
+#      load — this is a genuinely slow, one-time offline step, not
+#      something to run inline during the benchmark sweep.
+# ─────────────────────────────────────────────────────────────────────────────
+
+def _cape_cache_path(cache_dir: str, year: int, month: int) -> str:
+    os.makedirs(cache_dir, exist_ok=True)
+    return os.path.join(cache_dir, f"cape_clim_{year}_{month:02d}.npy")
+
+
+def build_era5_cape_climatology(year: int = CAPE_YEAR,
+                                 extent: list = CONUS_EXTENT,
+                                 out_dir: str = CAPE_CACHE_DIR,
+                                 nx: int = 384, ny: int = 384) -> None:
+    """
+    ONE-TIME precompute (see module comment above): fetch hourly ERA5 CAPE
+    for every month of `year` over `extent`, average to a monthly mean,
+    regrid to (ny, nx) over `extent`, and cache to disk as
+    cape_clim_<year>_<month>.npy. Run this once, offline — main-pipeline
+    calls (load_cape_for_event) only ever READ this cache.
+
+    Requires `cdsapi` (`pip install cdsapi`) and a configured ~/.cdsapirc
+    (see the download instructions in the module comment above). Each
+    month is fetched independently so a partial run (e.g. interrupted after
+    month 6) can be resumed — already-cached months are skipped.
+    """
+    try:
+        import cdsapi
+        import xarray as xr
+    except ImportError as e:
+        raise RuntimeError(
+            f"build_era5_cape_climatology requires cdsapi and xarray "
+            f"(pip install cdsapi xarray netCDF4): {e}"
+        )
+
+    os.makedirs(out_dir, exist_ok=True)
+    client = cdsapi.Client()
+    lon_min, lon_max, lat_min, lat_max = extent
+    # CDS area format is [north, west, south, east]
+    area = [lat_max, lon_min, lat_min, lon_max]
+
+    for month in range(1, 13):
+        cache_path = _cape_cache_path(out_dir, year, month)
+        if os.path.exists(cache_path):
+            log.info(f"  CAPE {year}-{month:02d}: already cached, skipping.")
+            continue
+
+        log.info(f"  CAPE {year}-{month:02d}: requesting from CDS "
+                 f"(this can take a while — server-side queue) …")
+        nc_path = os.path.join(out_dir, f"_tmp_cape_{year}_{month:02d}.nc")
+        client.retrieve(
+            "reanalysis-era5-single-levels",
+            {
+                "product_type": "reanalysis",
+                "variable": "convective_available_potential_energy",
+                "year": str(year),
+                "month": f"{month:02d}",
+                "day": [f"{d:02d}" for d in range(1, 32)],
+                "time": [f"{h:02d}:00" for h in range(0, 24, 3)],  # 3-hourly is enough for a monthly mean
+                "area": area,
+                "format": "netcdf",
+            },
+            nc_path,
+        )
+
+        ds = xr.open_dataset(nc_path)
+        var_name = "cape" if "cape" in ds.data_vars else list(ds.data_vars)[0]
+        # The new CDS API backend (cds.climate.copernicus.eu/api, as opposed
+        # to the old .../api/v2) renames the time dimension from "time" to
+        # "valid_time" in its NetCDF output. Detect whichever is actually
+        # present rather than hardcoding one, so this keeps working
+        # regardless of which CDS backend served the request.
+        time_dim = next(
+            (d for d in ("valid_time", "time") if d in ds[var_name].dims),
+            None,
+        )
+        if time_dim is None:
+            raise RuntimeError(
+                f"Could not find a time dimension in the downloaded CAPE "
+                f"file — dims present: {ds[var_name].dims}. CDS may have "
+                f"changed its output format again; update the "
+                f"('valid_time', 'time') tuple above to match."
+            )
+        monthly_mean = ds[var_name].mean(dim=time_dim).values.astype(np.float32)
+        lats = ds["latitude"].values
+        lons = ds["longitude"].values
+        ds.close()
+        os.remove(nc_path)
+
+        if lats[0] < lats[-1]:
+            pass
+        else:
+            lats = lats[::-1]
+            monthly_mean = monthly_mean[::-1, :]
+
+        from scipy.interpolate import RegularGridInterpolator
+        interp = RegularGridInterpolator(
+            (lats, lons), monthly_mean, method="linear",
+            bounds_error=False, fill_value=0.0,
+        )
+        tgt_lons, tgt_lats = get_sevir_grid(extent, nx, ny)
+        regridded = interp(
+            np.column_stack((tgt_lats.ravel(), tgt_lons.ravel()))
+        ).reshape(ny, nx).astype(np.float32)
+
+        np.save(cache_path, regridded)
+        log.info(f"  CAPE {year}-{month:02d}: cached -> {cache_path}  "
+                 f"(min={regridded.min():.1f}, max={regridded.max():.1f}, "
+                 f"mean={regridded.mean():.1f} J/kg)")
+
+    # Sanity check for CAPE_NORM_MAX, per the config comment above.
+    all_vals = []
+    for month in range(1, 13):
+        p = _cape_cache_path(out_dir, year, month)
+        if os.path.exists(p):
+            all_vals.append(np.load(p))
+    if all_vals:
+        stacked = np.concatenate([a.ravel() for a in all_vals])
+        p99 = float(np.percentile(stacked, 99))
+        log.info(f"  Climatology built. 99th percentile CAPE across all "
+                 f"{year} months: {p99:.1f} J/kg (CAPE_NORM_MAX is currently "
+                 f"{CAPE_NORM_MAX:.0f} — {'fine' if p99 > 0.2*CAPE_NORM_MAX else 'CONSIDER LOWERING, dynamic range will be compressed'}).")
+
+
+def get_event_month(event_id: str, sevir_catalog: pd.DataFrame) -> int:
+    """Event's calendar month (1-12), from the SEVIR catalog's time_utc
+    column, for picking which of the 12 cached monthly CAPE grids to use.
+    Falls back to month 7 (peak CONUS convective season) with a warning if
+    the column/event is missing, rather than failing the whole event."""
+    rows = sevir_catalog[sevir_catalog["id"] == event_id]
+    if not rows.empty and "time_utc" in sevir_catalog.columns:
+        try:
+            return int(pd.to_datetime(rows.iloc[0]["time_utc"]).month)
+        except Exception:
+            pass
+    log.warning(f"    No time_utc found for {event_id} — defaulting to "
+                f"July for CAPE climatology month lookup.")
+    return 7
+
+
+_cape_conus_cache: dict = {}   # {(year, month): (384,384) array}, in-memory
+
+
+def load_cape_for_event(event_id: str, sevir_catalog: pd.DataFrame,
+                         H: int, W: int, year: int = CAPE_YEAR,
+                         cache_dir: str = CAPE_CACHE_DIR) -> np.ndarray:
+    """
+    Crop+resample the precomputed monthly CONUS CAPE climatology (see
+    build_era5_cape_climatology — must be run first) to this event's own
+    extent and (H, W), normalised by CAPE_NORM_MAX and clipped to [0, 1].
+    Returns zeros (with a warning) if the climatology cache isn't built yet
+    — mirrors load_dem_from_cache's fallback behaviour so a cold/missing
+    cache degrades gracefully instead of crashing the whole sweep.
+    """
+    month = get_event_month(event_id, sevir_catalog)
+    cache_path = _cape_cache_path(cache_dir, year, month)
+    if not os.path.exists(cache_path):
+        log.warning(f"    CAPE climatology not built for {year}-{month:02d} "
+                    f"(run build_era5_cape_climatology({year}) first) — "
+                    f"using zeros.")
+        return np.zeros((H, W), dtype=np.float32)
+
+    key = (year, month)
+    if key not in _cape_conus_cache:
+        _cape_conus_cache[key] = np.load(cache_path)
+    conus_grid = _cape_conus_cache[key]   # (384, 384) over CONUS_EXTENT
+    extent = get_event_extent(event_id, sevir_catalog)
+    if extent is None:
+        return np.zeros((H, W), dtype=np.float32)
+
+    # Bilinear-resample from the CONUS grid onto this event's own extent —
+    # NOT a simple crop-and-resize, since the event's extent is a small
+    # sub-region of CONUS_EXTENT at a different effective resolution.
+    from scipy.interpolate import RegularGridInterpolator
+    conus_lons, conus_lats = get_sevir_grid(CONUS_EXTENT, conus_grid.shape[1], conus_grid.shape[0])
+    lat_1d = conus_lats[:, 0] if conus_lats[0, 0] != conus_lats[-1, 0] else conus_lats[0, :]
+    # get_sevir_grid returns full 2D lon/lat meshgrids (curvilinear under
+    # Lambert-Conformal), so build the interpolator on the raw (row, col)
+    # index space of CONUS_EXTENT's regular lon/lat SAMPLING grid instead —
+    # simpler and avoids assuming separability of a projected grid.
+    conus_tgt_lons, conus_tgt_lats = np.linspace(CONUS_EXTENT[0], CONUS_EXTENT[1], conus_grid.shape[1]), \
+                                      np.linspace(CONUS_EXTENT[2], CONUS_EXTENT[3], conus_grid.shape[0])
+    interp = RegularGridInterpolator(
+        (conus_tgt_lats, conus_tgt_lons), conus_grid,
+        method="linear", bounds_error=False, fill_value=0.0,
+    )
+    evt_lons, evt_lats = get_sevir_grid(extent, W, H)
+    cape_evt = interp(
+        np.column_stack((evt_lats.ravel(), evt_lons.ravel()))
+    ).reshape(H, W).astype(np.float32)
+
+    return np.clip(cape_evt / CAPE_NORM_MAX, 0.0, 1.0)
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# LAND TYPE  (blocks.tex line 889/892 — E_grid channel 3, 2-bit encoding)
+#
+# "Land type is a 2-bit binary encoding (ocean=00, land=10, coastline=01)
+# from MODIS." Like CAPE, this is a static, whole-CONUS, ONE-TIME precompute
+# (land cover doesn't vary meaningfully within Block A's timescales) — build
+# once via build_modis_landtype_grid(), then crop+resample per event.
+#
+# HOW TO DOWNLOAD: no new credentials needed — this reuses the exact same
+# Planetary Computer STAC pipeline already wired up for DEM (see
+# fetch_and_regrid_dem / HAS_DEM_LIBS above). The collection is
+# "io-lulc-9-class" (Esri 10m Annual Land Use/Land Cover, 2017-2022).
+# NOTE: MODIS MCD12Q1.061 ("modis-12Q1-061", IGBP land cover) is NOT
+# hosted on the Planetary Computer at all -- see build_modis_landtype_grid's
+# docstring for why this was swapped. Just run, once:
+#     python -c "import block_a_solver_benchmark as ba; \
+#                 ba.build_modis_landtype_grid(2019)"
+# ─────────────────────────────────────────────────────────────────────────────
+
+_LANDTYPE_CACHE_NAME = "landtype_{year}.npy"   # legacy whole-CONUS cache name
+
+
+_LANDCOVER_COLLECTION = "io-lulc-9-class"   # see note below
+_LANDCOVER_WATER_CLASS = 1                   # Esri 9-class LULC: 1 = Water
+
+
+def _landtype_cache_path(cache_dir: str, year: int, extent: list) -> str:
+    """
+    Disk cache filename for a (year, rounded extent) pair, mirroring
+    _dem_extent_cache_path's naming convention. Unlike the original
+    single, hardcoded whole-CONUS cache file (_LANDTYPE_CACHE_NAME, keyed
+    by year only), this lets multiple distinct regions each get their own
+    cached land-type tile -- exactly what makes dynamic, per-event/
+    per-extent prefetching (prefetch_landtype_for_events) possible instead
+    of requiring one fixed whole-CONUS precompute to be run first.
+    """
+    os.makedirs(cache_dir, exist_ok=True)
+    key = tuple(np.round(extent, 4))
+    name = "_".join(f"{v:.4f}" for v in key).replace("-", "m")
+    return os.path.join(cache_dir, f"landtype_{year}_{name}.npy")
+
+
+def _stac_search_lulc_items(year: int, extent: list, max_retries: int = 3):
+    """
+    STAC search for Esri 10m LULC tiles, timeout+retry wrapped exactly
+    like _stac_search_items does for DEM: both hit the same Planetary
+    Computer STAC endpoint and see the same transient
+    concurrent-connection-drop failures, so the same retry-with-backoff
+    logic (ported from prefetch_dem.py) applies here too.
+    """
+    catalog = pystac_client.Client.open(
+        "https://planetarycomputer.microsoft.com/api/stac/v1",
+        modifier=planetary_computer.sign_inplace,
+    )
+    lon_min, lon_max, lat_min, lat_max = extent
+    for attempt in range(max_retries):
+        try:
+            return list(catalog.search(
+                collections=[_LANDCOVER_COLLECTION],
+                bbox=[lon_min, lat_min, lon_max, lat_max],
+                datetime=f"{year}-01-01/{year}-12-31",
+            ).item_collection())
+        except Exception:
+            if attempt == max_retries - 1:
+                raise
+            time.sleep(2)
+
+
+def _load_and_clip_lulc_tile(item, extent: list, max_retries: int = 3):
+    """
+    Per-tile Esri LULC fetch + clip (in EPSG:4326) + reproject, retry-
+    wrapped exactly like _load_and_clip_tile does for DEM tiles -- a
+    single VSICURL read can drop transiently, and LULC tiles are large
+    enough at overview_level=3 that retrying just the one failed tile is
+    much cheaper than failing the whole unique-extent fetch. Submitted to
+    the SAME shared _tile_fetch_pool used for DEM, so per-region LULC
+    fetches stay bounded by the one module-level concurrency cap even
+    when multiple extents/events are being prefetched at once (see
+    prefetch_landtype_for_events) -- exactly the DEM fix this mirrors.
+
+    Returns None (not an exception) when the tile only loosely intersects
+    `extent` (STAC bbox overlap without actual raster data in bounds),
+    since that's an expected, non-retryable outcome, not a transient
+    failure.
+    """
+    lon_min, lon_max, lat_min, lat_max = extent
+    asset_key = "data" if "data" in item.assets else list(item.assets.keys())[0]
+    for attempt in range(max_retries):
+        try:
+            # overview_level=3 downsamples 10m to ~80m on the fly, erasing
+            # tiny puddles so they don't become meteorologically
+            # irrelevant "coastlines".
+            da = rioxarray.open_rasterio(
+                item.assets[asset_key].href, overview_level=3, lock=False
+            ).squeeze()
+            # Esri LULC tiles are in UTM zones (projected metres), not
+            # degrees -- clip_box must be told our bounds are EPSG:4326.
+            da = da.rio.clip_box(minx=lon_min, miny=lat_min,
+                                  maxx=lon_max, maxy=lat_max, crs="EPSG:4326")
+            # CONUS (and any multi-tile extent) spans multiple UTM zones,
+            # so reproject to a common lat/lon grid before merging, or
+            # merge_arrays chokes on the CRS mismatch.
+            da = da.rio.reproject("EPSG:4326")
+            return da.load()
+        except NoDataInBounds:
+            return None
+        except Exception:
+            if attempt < max_retries - 1:
+                time.sleep(2)
+            else:
+                raise
+
+
+def _fetch_and_regrid_landtype(year: int, extent: list,
+                                nx: int = 384, ny: int = 384) -> np.ndarray:
+    """
+    Fetch Esri 10m LULC tiles overlapping `extent` for `year`, bin into
+    ocean/land/coastline, and regrid onto the (ny, nx) SEVIR grid for that
+    extent. This is the tile-level engine shared by both
+    build_modis_landtype_grid (single whole-CONUS call) and
+    prefetch_landtype_for_events (concurrent, per-event-extent calls) --
+    factored out exactly as fetch_and_regrid_dem is shared between
+    load_dem_from_cache and prefetch_dem_for_events, so both callers get
+    the same retry-with-backoff / bounded-concurrency / incremental-
+    batched-merge behaviour instead of two divergent implementations.
+
+    Returns the (ny, nx, 2) two-bit [land_bit1, land_bit0] encoding
+    (ocean=00, land=10, coastline=01). Falls back to an all-ocean (zeros)
+    grid, with a warning, if the search/fetch fails entirely -- mirrors
+    fetch_and_regrid_dem's all-zero fallback so a bad extent degrades
+    gracefully instead of crashing the whole prefetch/sweep.
+    """
+    if not HAS_DEM_LIBS:
+        return np.zeros((ny, nx, 2), dtype=np.float32)
+
+    log.info(f"    Searching Esri 10m LULC ({year}) via Planetary Computer …")
+    try:
+        items = _stac_search_pool.submit(_stac_search_lulc_items, year, extent) \
+                                  .result(timeout=_STAC_SEARCH_TIMEOUT_SEC)
+    except Exception as exc:
+        log.warning(f"    LULC STAC search failed ({exc}) — using all-ocean zeros.")
+        return np.zeros((ny, nx, 2), dtype=np.float32)
+
+    if not items:
+        log.warning(f"    No LULC tiles found for {year}/{extent} — using all-ocean zeros.")
+        return np.zeros((ny, nx, 2), dtype=np.float32)
+
+    log.info(f"    {len(items)} LULC tile(s) overlap this extent "
+             f"(pool cap: {_TILE_FETCH_MAX_WORKERS} concurrent, shared with DEM fetches).")
+
+    # Concurrent, retry-wrapped tile fetch + incremental batched merge --
+    # identical pattern to fetch_and_regrid_dem's _fold_batch, bounding
+    # peak memory to ~one batch + one running accumulator even when a
+    # large extent (e.g. all of CONUS) overlaps dozens of UTM-zone tiles.
+    fmap = {_tile_fetch_pool.submit(_load_and_clip_lulc_tile, it, extent): i
+            for i, it in enumerate(items)}
+
+    running_merged = None
+    batch: list = []
+    BATCH_SIZE = _TILE_FETCH_MAX_WORKERS
+    n_failed = 0
+
+    def _fold_batch():
+        nonlocal running_merged, batch
+        if not batch:
+            return
+        to_merge = ([running_merged] if running_merged is not None else []) + batch
+        running_merged = merge_arrays(to_merge) if len(to_merge) > 1 else to_merge[0]
+        batch = []
+
+    for fut in as_completed(fmap):
+        i = fmap[fut]
+        try:
+            da = fut.result(timeout=_TILE_FETCH_TIMEOUT_SEC)
+            if da is not None and da.size > 0:
+                batch.append(da)
+            if len(batch) >= BATCH_SIZE:
+                _fold_batch()
+        except Exception as e:
+            n_failed += 1
+            log.warning(f"    LULC tile {i} failed/timed out: {e}")
+    _fold_batch()
+
+    if n_failed:
+        log.warning(f"    {n_failed}/{len(items)} LULC tiles failed or timed out.")
+
+    if running_merged is None:
+        log.warning(f"    All LULC tiles were out of bounds or failed for "
+                    f"{extent} — using all-ocean zeros.")
+        return np.zeros((ny, nx, 2), dtype=np.float32)
+
+    merged = running_merged
+    lons, lats, lc_data = merged.x.values, merged.y.values, merged.values.astype(np.int16)
+    del merged, running_merged, batch
+
+    if lats[0] > lats[-1]:
+        lats = lats[::-1]
+        lc_data = lc_data[::-1, :]
+
+    interp = RegularGridInterpolator(
+        (lats, lons), lc_data, method="nearest", bounds_error=False, fill_value=1,
+    )
+    tgt_lons, tgt_lats = get_sevir_grid(extent, nx, ny)
+    lc_grid = interp(np.column_stack((tgt_lats.ravel(), tgt_lons.ravel()))).reshape(ny, nx).astype(np.int16)
+    del lc_data
+
+    # Esri 10m LULC mapping: 1 is Water. Everything else is Land.
+    is_water = (lc_grid == _LANDCOVER_WATER_CLASS)
+    is_land  = ~is_water
+
+    water_dilated = binary_dilation(is_water, iterations=1)
+    is_coastline = is_land & water_dilated
+
+    land_bit1 = (is_land & ~is_coastline).astype(np.float32)   # land=10
+    land_bit0 = is_coastline.astype(np.float32)                 # coastline=01
+    return np.stack([land_bit1, land_bit0], axis=-1)
+
+
+def _crop_landtype_from_conus(conus_grid: np.ndarray, extent: list,
+                               H: int, W: int) -> np.ndarray:
+    """
+    Nearest-neighbour crop+resample of a precomputed whole-CONUS land-type
+    grid onto a specific event's own (extent, H, W) -- the cheap, in-memory
+    path used both by load_landtype_for_event and, as a fast path, by
+    _get_or_fetch_landtype when a whole-CONUS precompute already exists on
+    disk (so callers don't pay a fresh network fetch per event once CONUS
+    has been built once).
+    """
+    conus_lats = np.linspace(CONUS_EXTENT[2], CONUS_EXTENT[3], conus_grid.shape[0])
+    conus_lons = np.linspace(CONUS_EXTENT[0], CONUS_EXTENT[1], conus_grid.shape[1])
+    evt_lons, evt_lats = get_sevir_grid(extent, W, H)
+    out = np.zeros((H, W, 2), dtype=np.float32)
+    for bit in range(2):
+        interp = RegularGridInterpolator(
+            (conus_lats, conus_lons), conus_grid[..., bit],
+            method="nearest", bounds_error=False, fill_value=0.0,
+        )
+        out[..., bit] = interp(
+            np.column_stack((evt_lats.ravel(), evt_lons.ravel()))
+        ).reshape(H, W)
+    return out
+
+
+def _get_or_fetch_landtype(year: int, extent: list,
+                            out_dir: str = LANDTYPE_CACHE_DIR,
+                            nx: int = 384, ny: int = 384) -> np.ndarray:
+    """
+    Extent-keyed disk cache (_landtype_cache_path) in front of
+    _fetch_and_regrid_landtype -- the land-type analogue of
+    _get_or_fetch_raw_dem. This is what lets prefetch_landtype_for_events
+    fetch a distinct region per unique event extent (instead of only ever
+    reading the one hardcoded whole-CONUS array), while still sharing one
+    cache hit across every event with the same extent.
+
+    Fast path: if the legacy whole-CONUS precompute (build_modis_landtype_
+    grid's original single-file cache) already exists on disk, crop+
+    resample from that in-memory grid instead of issuing a fresh STAC
+    fetch for this extent -- so users who've already run the one-time
+    CONUS precompute don't pay a network cost per event. Falls through to
+    a genuine per-extent network fetch (the new dynamic-prefetch path)
+    only when that legacy cache isn't there yet.
+    """
+    os.makedirs(out_dir, exist_ok=True)
+    cache_path = _landtype_cache_path(out_dir, year, extent)
+
+    if os.path.exists(cache_path):
+        try:
+            cached = np.load(cache_path).astype(np.float32)
+            if cached.shape == (ny, nx, 2) and cached.size > 0:
+                return cached
+        except Exception as exc:
+            log.warning(f"    Could not read cached land-type tile "
+                        f"{cache_path} ({exc}) — refetching.")
+
+    legacy_path = os.path.join(out_dir, _LANDTYPE_CACHE_NAME.format(year=year))
+    if os.path.exists(legacy_path):
+        if year not in _landtype_conus_cache:
+            _landtype_conus_cache[year] = np.load(legacy_path)
+        encoded = _crop_landtype_from_conus(
+            _landtype_conus_cache[year], extent, ny, nx
+        )
+    else:
+        encoded = _fetch_and_regrid_landtype(year, extent, nx=nx, ny=ny)
+
+    try:
+        np.save(cache_path, encoded)
+    except Exception as exc:
+        log.warning(f"    Could not write land-type cache {cache_path}: {exc}")
+    return encoded
+
+
+def build_modis_landtype_grid(year: int = CAPE_YEAR,
+                               extent: list = CONUS_EXTENT,
+                               out_dir: str = LANDTYPE_CACHE_DIR,
+                               nx: int = 384, ny: int = 384) -> None:
+    """
+    ONE-TIME precompute: fetch a land-cover classification for `year`
+    over `extent` via the Planetary Computer STAC API (same client setup
+    as fetch_and_regrid_dem), regrid to (ny, nx) with NEAREST-NEIGHBOUR
+    resampling (class IDs are categorical — bilinear interpolation across
+    class boundaries would invent nonsense intermediate "classes"), bin
+    into ocean/land/coastline, and cache the resulting 2-bit encoding as
+    a single (ny, nx, 2) array of {0, 1}.
+
+    NOTE ON DATA SOURCE (2026-07 fix): this originally targeted MODIS
+    MCD12Q1.061 (collection id "modis-12Q1-061"), matching blocks.tex's
+    reference to IGBP land cover. That collection does NOT exist on the
+    Planetary Computer — MCD12Q1 was never ingested there (unlike other
+    MODIS products such as 09A1/11A1/13A1/14A1, which are hosted). This
+    is a permanent data-availability gap, not a transient search bug, so
+    no amount of retrying/pagination/date-window tweaking fixes it; see
+    https://github.com/microsoft/PlanetaryComputer/discussions/144 (open
+    request to add MCD12Q1, unresolved as of writing) and the MODIS group
+    listing at https://planetarycomputer.microsoft.com/dataset/group/modis
+    (12Q1 absent). We instead use `io-lulc-9-class` (Esri 10m Annual Land
+    Use/Land Cover, Impact Observatory / Esri / Microsoft), which IS
+    hosted on PC and covers 2017-2022. It uses a different class legend
+    than IGBP, so only the water/land bit is semantically equivalent —
+    class 1 = "Water" is used in place of IGBP's class 17. If exact IGBP
+    semantics from MCD12Q1.061 are required, fetch it directly from NASA
+    Earthdata instead (e.g. via the `earthaccess` package), since it is
+    simply not available through this STAC endpoint.
+
+    Binning: land-cover "Water" class -> ocean. Land = everything else.
+    Coastline = any LAND pixel with at least one WATER pixel among its 8
+    nearest neighbours (a simple boundary dilation, not a separate class)
+    -- overrides the land/ocean bit for those pixels per blocks.tex's
+    ocean=00/land=10/coastline=01 convention (three mutually exclusive
+    categories via two bits, not two independent binary flags).
+    """
+    if not HAS_DEM_LIBS:
+        raise RuntimeError(
+            "build_modis_landtype_grid needs the same STAC stack as DEM "
+            "(pystac_client, planetary_computer, rioxarray) — none found."
+        )
+    os.makedirs(out_dir, exist_ok=True)
+    cache_path = os.path.join(out_dir, _LANDTYPE_CACHE_NAME.format(year=year))
+    if os.path.exists(cache_path):
+        log.info(f"  Land type {year}: already cached at {cache_path}.")
+        return
+
+    log.info(f"  Land type {year}: searching Esri 10m LULC via Planetary Computer STAC …")
+    encoded = _fetch_and_regrid_landtype(year, extent, nx=nx, ny=ny)
+    if not np.any(encoded):
+        raise RuntimeError(
+            f"No usable Esri 10m LULC tiles found/loaded for {year}/{extent} "
+            f"(see warnings above for the STAC search / tile-fetch failure)."
+        )
+
+    np.save(cache_path, encoded)
+    is_water     = (encoded[..., 0] == 0) & (encoded[..., 1] == 0)
+    is_coastline = encoded[..., 1] == 1
+    frac_ocean = float(np.mean(is_water))
+    frac_coast = float(np.mean(is_coastline))
+    log.info(f"  Land type {year}: cached -> {cache_path}  "
+             f"(ocean={frac_ocean:.1%}, coastline={frac_coast:.1%}, "
+             f"land={1 - frac_ocean - frac_coast:.1%})")
+
+
+_landtype_conus_cache: dict = {}   # {year: (384,384,2) array}, in-memory
+
+
+def load_landtype_for_event(event_id: str, sevir_catalog: pd.DataFrame,
+                             H: int, W: int, year: int = CAPE_YEAR,
+                             cache_dir: str = LANDTYPE_CACHE_DIR) -> np.ndarray:
+    """
+    Crop+nearest-neighbour-resample the precomputed CONUS land-type grid
+    (see build_modis_landtype_grid — must be run first) to this event's
+    own extent and (H, W). Returns (H, W, 2) = [land_bit1, land_bit0]
+    matching blocks.tex's ocean=00/land=10/coastline=01 convention.
+    Returns zeros (= ocean default, with a warning) if the cache isn't
+    built yet.
+
+    This is the cheap, purely in-memory crop path for the ONE-TIME
+    whole-CONUS precompute workflow. If you'd rather fetch land type
+    dynamically, per-event-extent, without requiring that CONUS precompute
+    to exist first (e.g. for a quick --n_events test, or a region outside
+    CONUS_EXTENT), use prefetch_landtype_for_events instead — it shares
+    this same crop fast-path when a CONUS cache IS present, and falls back
+    to a genuine concurrent per-extent fetch when it isn't.
+    """
+    cache_path = os.path.join(cache_dir, _LANDTYPE_CACHE_NAME.format(year=year))
+    if not os.path.exists(cache_path):
+        log.warning(f"    Land type grid not built for {year} (run "
+                    f"build_modis_landtype_grid({year}) first, or use "
+                    f"prefetch_landtype_for_events for dynamic per-event "
+                    f"fetching) — using zeros (= ocean default).")
+        return np.zeros((H, W, 2), dtype=np.float32)
+
+    if year not in _landtype_conus_cache:
+        _landtype_conus_cache[year] = np.load(cache_path)
+    extent = get_event_extent(event_id, sevir_catalog)
+    if extent is None:
+        return np.zeros((H, W, 2), dtype=np.float32)
+
+    return _crop_landtype_from_conus(_landtype_conus_cache[year], extent, H, W)
+
+
+def prefetch_landtype_for_events(
+        event_ids:      list,
+        sevir_catalog:  pd.DataFrame,
+        channel_shapes: dict,
+        year:           int = CAPE_YEAR,
+        out_dir:        str = LANDTYPE_CACHE_DIR,
+        max_workers:    int = 3,
+) -> dict:
+    """
+    Dynamic, per-event land-type prefetch — the land-type analogue of
+    prefetch_dem_for_events. Instead of requiring the original single
+    blocking whole-CONUS call (build_modis_landtype_grid) to have been run
+    up front, this fetches (or loads from the extent-keyed disk cache) a
+    land-type tile sized to EACH sampled event's own extent, deduplicated
+    by unique rounded extent and fetched CONCURRENTLY up front — the same
+    unique-extent dedup + bounded-concurrency pattern prefetch_dem_for_
+    events uses for DEM, sharing the same underlying STAC search pool /
+    tile-fetch pool / retry-with-backoff logic under the hood (see
+    _fetch_and_regrid_landtype / _get_or_fetch_landtype).
+
+    If a whole-CONUS precompute already exists on disk, each unique extent
+    is served from that in-memory grid via a cheap crop+resample instead
+    of a fresh network fetch (see _get_or_fetch_landtype's fast path) — so
+    this is safe to call either way: with or without having run
+    build_modis_landtype_grid first.
+
+    Returns {event_id: landtype_grid} where landtype_grid is (H, W, 2) =
+    [land_bit1, land_bit0], resized to that event's own (H, W) from
+    whichever unique extent's fetch it shares. Events for which the fetch
+    ultimately fails fall back to an all-ocean (zeros) grid of the correct
+    shape.
+    """
+    os.makedirs(out_dir, exist_ok=True)
+    todo = [eid for eid in event_ids if eid in channel_shapes]
+    results: dict = {}
+    if not todo:
+        return results
+
+    # Group events by unique (rounded) extent, exactly as
+    # prefetch_dem_for_events does, so each distinct region's land-type
+    # tile is fetched/cropped exactly once regardless of how many sampled
+    # events happen to share it.
+    extent_to_events: dict = {}
+    for eid in todo:
+        extent = get_event_extent(eid, sevir_catalog)
+        if extent is None:
+            log.warning(f"    No extent found for {eid} — land type = "
+                        f"zeros (ocean default).")
+            H, W = channel_shapes[eid]
+            results[eid] = np.zeros((H, W, 2), dtype=np.float32)
+            continue
+        key = tuple(np.round(extent, 4))
+        extent_to_events.setdefault(key, (extent, []))
+        extent_to_events[key][1].append(eid)
+
+    n_unique = len(extent_to_events)
+    n_cached = sum(
+        1 for key in extent_to_events
+        if os.path.exists(_landtype_cache_path(out_dir, year, extent_to_events[key][0]))
+    )
+    log.info(
+        f"Prefetching land type for {len(todo)} events -> {n_unique} unique "
+        f"extent(s) ({n_cached} already cached, {n_unique - n_cached} to "
+        f"fetch) with up to {max_workers} concurrent workers …"
+    )
+
+    def _fetch_one(key: tuple):
+        extent, _eids = extent_to_events[key]
+        return key, _get_or_fetch_landtype(year, extent, out_dir=out_dir)
+
+    t0 = time.time()
+    with ThreadPoolExecutor(max_workers=max_workers) as pool:
+        futures = {pool.submit(_fetch_one, key): key for key in extent_to_events}
+        for fut in tqdm(as_completed(futures), total=len(futures),
+                         desc="Land-type prefetch (unique extents)"):
+            key = futures[fut]
+            extent, eids = extent_to_events[key]
+            try:
+                _, landtype_canonical = fut.result()
+            except Exception as exc:
+                log.warning(f"  extent {key} ({len(eids)} event(s)): "
+                            f"land-type prefetch failed ({exc}) — using zeros.")
+                landtype_canonical = np.zeros((384, 384, 2), dtype=np.float32)
+
+            # Broadcast this ONE fetched/cropped tile to every event that
+            # shares the extent, resizing to each event's own (H, W).
+            for eid in eids:
+                H, W = channel_shapes[eid]
+                lt = landtype_canonical
+                if lt.shape[:2] != (H, W):
+                    # Categorical bits -> nearest-neighbour resize (not
+                    # cv2's bilinear default), so boundary pixels don't get
+                    # invented fractional "half coastline" values.
+                    lt = cv2.resize(lt, (W, H), interpolation=cv2.INTER_NEAREST)
+                results[eid] = lt
+
+            try:
+                import resource
+                peak_mb = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss / 1024
+                log.info(f"  extent {key} ({len(eids)} event(s)): done  |  "
+                         f"peak RSS so far: {peak_mb:,.0f} MB")
+            except Exception:
+                pass
+    log.info(f"Land-type prefetch complete in {time.time() - t0:.1f}s "
+             f"({len(results)}/{len(todo)} events, {n_unique} unique "
+             f"extent(s) fetched).")
+    return results
+
+
+# ─────────────────────────────────────────────────────────────────────────────
 # OPTICAL FLOW  (A.5 step 4 — logged only; positions static in Block A)
 # ─────────────────────────────────────────────────────────────────────────────
 
@@ -1109,6 +1862,8 @@ def build_graph_topological(
         c_sigma: float,
         t_idx: int = 0,
         flows: Optional[list[np.ndarray]] = None,
+        cape_norm: Optional[np.ndarray] = None,
+        landtype_grid: Optional[np.ndarray] = None,
 ) -> Optional[dict]:
     """
     A.5: build the Lagrangian superpixel graph, using TemporalSLIC_DEM
@@ -1268,6 +2023,29 @@ def build_graph_topological(
     env[:, 1] = positions[:, 1] / H
     env[:, 2] = h0[:, 0]   # VIL
     env[:, 3] = h0[:, 1]   # IR107
+
+    # E_grid channels (blocks.tex line 889, C_env=3): DEM_norm, CAPE_clim,
+    # land_type_onehot_2bit. Sampled at each superpixel centroid, matching
+    # eq.~887's BilinearSample(E_grid, x) -- centroid coordinates are
+    # already available as integer pixel indices via `positions` (same
+    # indexing used for env[:,0:2] above), so this is a direct grid lookup,
+    # not a separate resample. dem_norm was already being computed/threaded
+    # through this whole call chain (it drives TemporalSLIC_DEM's 4th
+    # feature-cube channel above) but was NEVER actually added to `env`
+    # until now -- callers upstream must now also pass cape_norm/
+    # landtype_grid (see load_cape_for_event / load_landtype_for_event),
+    # or these 3 channels silently fall back to zero.
+    xs_env = np.clip(positions[:, 0].astype(int), 0, W - 1)
+    ys_env = np.clip(positions[:, 1].astype(int), 0, H - 1)
+    env[:, 4] = dem_norm[ys_env, xs_env]
+    if cape_norm is not None:
+        env[:, 5] = cape_norm[ys_env, xs_env]
+    if landtype_grid is not None:
+        env[:, 6] = landtype_grid[ys_env, xs_env, 0]   # land_bit1
+        env[:, 7] = landtype_grid[ys_env, xs_env, 1]   # land_bit0
+    # else: env[:,5:8] stay 0 (CAPE=0 J/kg-normalised, land bits=(0,0)=ocean
+    # default) -- same graceful-degradation convention as DEM's all-zero
+    # fallback when its own pipeline/cache is unavailable.
 
     return {
         "positions":       positions,
@@ -2579,6 +3357,8 @@ def benchmark_event(
         sigma_init:      float,
         rtol:            float = RTOL_DEFAULT,
         atol:            float = ATOL_DEFAULT,
+        cape_norm:       Optional[np.ndarray] = None,
+        landtype_grid:   Optional[np.ndarray] = None,
 ) -> list[dict]:
     """
     For a single event, sweep N and return a list of result rows.
@@ -2589,7 +3369,8 @@ def benchmark_event(
     for N in n_values:
         log.debug(f"    N={N} …")
 
-        graph = build_graph_topological(channels, dem_norm, N=N, c_sigma=c_sigma)
+        graph = build_graph_topological(channels, dem_norm, N=N, c_sigma=c_sigma,
+                                         cape_norm=cape_norm, landtype_grid=landtype_grid)
         if graph is None:
             log.warning(f"    N={N}: graph build failed, skipping.")
             continue
@@ -2715,6 +3496,8 @@ def _benchmark_event_worker(payload: dict) -> dict:
         sigma_init=payload["sigma_init"],
         rtol=payload["rtol"],
         atol=payload["atol"],
+        cape_norm=payload.get("cape_norm"),
+        landtype_grid=payload.get("landtype_grid"),
     )
     return {"event_id": payload["event_id"], "cls": payload["cls"], "rows": rows}
 
@@ -2819,11 +3602,31 @@ def run_benchmark(
     dem_by_event = prefetch_dem_for_events(
         list(channels_by_event.keys()), sevir_catalog, channel_shapes,
     )
+    # Land-type: same dynamic, concurrent, extent-deduped prefetch pattern
+    # as DEM above -- NOT load_landtype_for_event, which hard-requires a
+    # whole-CONUS build_modis_landtype_grid() precompute to already exist
+    # on disk and silently returns all-zero (ocean default) grids for
+    # every event otherwise. prefetch_landtype_for_events still uses that
+    # CONUS cache as a fast path when present, but falls back to a genuine
+    # per-extent fetch when it isn't -- see its docstring.
+    landtype_by_event = prefetch_landtype_for_events(
+        list(channels_by_event.keys()), sevir_catalog, channel_shapes,
+    )
 
     event_data: dict[str, dict] = {}
     for event_id, channels in channels_by_event.items():
         dem_norm = dem_by_event.get(
             event_id, np.zeros(channel_shapes[event_id], dtype=np.float32)
+        )
+        H_evt, W_evt = channel_shapes[event_id]
+        # CAPE is a cheap in-memory crop of a precomputed, whole-CONUS
+        # array (see load_cape_for_event module comments) -- unlike DEM/
+        # land-type there's no network fetch here, so no separate
+        # prefetch-and-parallelise step is needed; each call just indexes
+        # into the (year,month)-keyed in-memory cache.
+        cape_norm = load_cape_for_event(event_id, sevir_catalog, H_evt, W_evt)
+        landtype_grid = landtype_by_event.get(
+            event_id, np.zeros((H_evt, W_evt, 2), dtype=np.float32)
         )
         event_data[event_id] = {
             "lifecycle_class": class_by_event[event_id],
@@ -2835,6 +3638,8 @@ def run_benchmark(
             # Visualize_sevir_with_superpixel_fused.py, so pre-weighting
             # here would double-apply lambda_z.
             "dem_norm":        dem_norm,
+            "cape_norm":       cape_norm,
+            "landtype_grid":   landtype_grid,
         }
     log.info(f"Loaded channel+DEM data for {len(event_data)}/{len(sampled)} sampled events")
     if not event_data:
@@ -2876,7 +3681,9 @@ def run_benchmark(
         if len(bucket) >= 5:
             continue
         g = build_graph_topological(d["channels"], d["dem_norm"],
-                                     N=N_STAR, c_sigma=c_sigma)
+                                     N=N_STAR, c_sigma=c_sigma,
+                                     cape_norm=d.get("cape_norm"),
+                                     landtype_grid=d.get("landtype_grid"))
         if g is not None:
             bucket.append(g)
 
@@ -2969,6 +3776,8 @@ def run_benchmark(
             "sigma_init": class_sigma.get(d["lifecycle_class"], 1.0),
             "rtol":       rtol,
             "atol":       atol,
+            "cape_norm":     d.get("cape_norm"),
+            "landtype_grid": d.get("landtype_grid"),
         }
         for event_id, d in event_data.items()
     ]
