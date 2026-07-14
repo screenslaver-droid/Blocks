@@ -63,6 +63,7 @@ import block_a_solver_benchmark as ba  # the module under test
 if not ba.JAX_OK:
     sys.exit("JAX/Diffrax not available — cannot run the smoke test.")
 
+import jax
 import jax.numpy as jnp
 
 LIFECYCLE_CLASSES = list(ba.TARGET_RHO.keys())   # the 7 classes, in TARGET_RHO order
@@ -183,14 +184,50 @@ def run_one_event(event_id: str, lifecycle_class: str, channels: dict,
     # docstring — SiLU's non-saturating growth means it may not be.
     rho_profile = ba.assess_reaction_stability_away_from_h0(weights, h0_jax, env_jax)
 
+    # Wall-clock timing. IMPORTANT: JAX JIT-compiles imex_strang_integrate/
+    # dopri5_integrate on first call for a given array-shape signature (N_act,
+    # edge count, ...), so a single raw timing conflates one-time compile
+    # cost with actual solve cost -- exactly why NFE, not wall-clock, has
+    # been the primary metric throughout this pipeline (NFE is compile- and
+    # hardware-independent; wall-clock isn't). Record BOTH: the raw first-
+    # call time (what a user actually experiences once per shape) and a
+    # second "warm" re-run of the identical call (steady-state solve time,
+    # with compilation already cached) so both numbers are available and
+    # neither is silently conflated with the other.
+    t0 = time.perf_counter()
     h_imex, nfe_diff, nfe_rxn, rej_diff, rej_rxn, ok_imex = \
         ba.imex_strang_integrate(h0_jax, diff_rhs, rxn_rhs, n_steps=n_macro_steps,
                                   rtol=rtol, atol=atol,
                                   event_id=event_id, lifecycle_class=lifecycle_class)
+    jax.block_until_ready(h_imex)   # ensure the timer captures the actual compute,
+    wall_imex_raw = time.perf_counter() - t0   # not just async dispatch return
+
+    t0 = time.perf_counter()
     h_dop, nfe_dop, rej_dop, ok_dop = \
         ba.dopri5_integrate(h0_jax, diff_rhs, rxn_rhs, n_steps=n_macro_steps,
                              rtol=rtol, atol=atol,
                              event_id=event_id, lifecycle_class=lifecycle_class)
+    jax.block_until_ready(h_dop)
+    wall_dopri5_raw = time.perf_counter() - t0
+
+    # Warm re-run: same shapes/args, so this hits JAX's compilation cache --
+    # isolates steady-state per-solve cost from the one-time compile cost
+    # baked into the numbers above.
+    t0 = time.perf_counter()
+    h_imex_warm, *_ = ba.imex_strang_integrate(
+        h0_jax, diff_rhs, rxn_rhs, n_steps=n_macro_steps, rtol=rtol, atol=atol,
+        event_id=event_id, lifecycle_class=lifecycle_class,
+    )
+    jax.block_until_ready(h_imex_warm)
+    wall_imex_warm = time.perf_counter() - t0
+
+    t0 = time.perf_counter()
+    h_dop_warm, *_ = ba.dopri5_integrate(
+        h0_jax, diff_rhs, rxn_rhs, n_steps=n_macro_steps, rtol=rtol, atol=atol,
+        event_id=event_id, lifecycle_class=lifecycle_class,
+    )
+    jax.block_until_ready(h_dop_warm)
+    wall_dopri5_warm = time.perf_counter() - t0
 
     l2_err = float(jnp.linalg.norm(h_imex - h_dop)) / (float(jnp.linalg.norm(h_dop)) + 1e-12)
 
@@ -231,6 +268,14 @@ def run_one_event(event_id: str, lifecycle_class: str, channels: dict,
         "dopri5_converged": ok_dop,
         "nfe_ratio": nfe_dop / (nfe_diff + nfe_rxn + 1),
         "solution_l2_error": l2_err,
+        # Raw = includes one-time JIT compilation for this array-shape
+        # signature; warm = steady-state solve time with compilation
+        # already cached. wall_*_raw - wall_*_warm ~= compile overhead.
+        "wall_imex_raw_sec":    round(wall_imex_raw, 4),
+        "wall_imex_warm_sec":   round(wall_imex_warm, 4),
+        "wall_dopri5_raw_sec":  round(wall_dopri5_raw, 4),
+        "wall_dopri5_warm_sec": round(wall_dopri5_warm, 4),
+        "wall_speedup_warm":    round(wall_dopri5_warm / max(wall_imex_warm, 1e-9), 4),
         "h_imex_finite": bool(np.all(np.isfinite(np.asarray(h_imex)))),
         "h_dop_finite": bool(np.all(np.isfinite(np.asarray(h_dop)))),
         "imex_failure_verdict":   divergence_diag.get("reaction", {}).get("verdict", ""),
