@@ -49,6 +49,7 @@ import os
 import sys
 import time
 from concurrent.futures import ProcessPoolExecutor, ThreadPoolExecutor, as_completed
+from typing import Optional
 
 import numpy as np
 import pandas as pd
@@ -158,8 +159,13 @@ def run_one_event(event_id: str, lifecycle_class: str, channels: dict,
                    D: float, sigma_init: float, seed: int = 0,
                    n_macro_steps: int = ba.N_MACRO_STEPS,
                    rtol: float = ba.RTOL_DEFAULT,
-                   atol: float = ba.ATOL_DEFAULT) -> dict:
-    graph = ba.build_graph_topological(channels, dem_norm, N=N, c_sigma=c_sigma)
+                   atol: float = ba.ATOL_DEFAULT,
+                   cape_norm: Optional[np.ndarray] = None,
+                   landtype_grid: Optional[np.ndarray] = None) -> dict:
+    
+    # Updated to pass environmental grids through
+    graph = ba.build_graph_topological(channels, dem_norm, N=N, c_sigma=c_sigma,
+                                       cape_norm=cape_norm, landtype_grid=landtype_grid)
     if graph is None:
         raise RuntimeError(f"{event_id}: graph build failed")
 
@@ -227,10 +233,6 @@ def run_one_event(event_id: str, lifecycle_class: str, channels: dict,
         "solution_l2_error": l2_err,
         "h_imex_finite": bool(np.all(np.isfinite(np.asarray(h_imex)))),
         "h_dop_finite": bool(np.all(np.isfinite(np.asarray(h_dop)))),
-        # Small, CSV-safe summary of the divergence-vs-stiffness diagnostic
-        # (the full per-step histories used for plotting are NOT put in
-        # `result` — they're returned separately as `divergence_diag` — to
-        # keep this dict flat/scalar, since it's what becomes a CSV row).
         "imex_failure_verdict":   divergence_diag.get("reaction", {}).get("verdict", ""),
         "dopri5_failure_verdict": divergence_diag.get("dopri5", {}).get("verdict", ""),
     }
@@ -260,7 +262,6 @@ def plot_event_diagnostics(event_id, cls, channels, dem_raw, dem_norm,
     ax.imshow(vil0, cmap="turbo", origin="upper")
     pos = graph["positions"]
     s, r = graph["senders"], graph["receivers"]
-    # draw each undirected edge once
     seen = set()
     for i in range(len(s)):
         key = tuple(sorted((int(s[i]), int(r[i]))))
@@ -294,19 +295,9 @@ def plot_event_diagnostics(event_id, cls, channels, dem_raw, dem_norm,
     ax.legend(fontsize=8)
 
     # ── (1,1) Integration step diagnostic — accepted vs. rejected steps ─────
-    # This is the panel that actually explains *why* a solver failed: a
-    # rejection cascade (Kvaerno5's Newton iteration failing to converge
-    # over and over, or DOPRI5's PID controller shrinking dt down to
-    # thousands of accepted-but-microscopic steps) shows up here directly
-    # as either a tall red (rejected) bar or a huge green (accepted) bar,
-    # long before you'd notice anything from the final-state agreement
-    # scatter this panel used to show.
     ax = axes[1, 1]
     stage_labels = ["Tsit5\n(diffusion)", "Kvaerno5\n(reaction)", "DOPRI5\n(unsplit)"]
 
-    # Accepted-step counts aren't stored directly in `result` (only the
-    # NFE, which is accepted_steps x stage_count) — recover them exactly
-    # by dividing back out, since nfe_X = accepted_X * STAGE_COUNT_X.
     accepted = [
         result["nfe_diffusion"] / ba.STAGE_COUNT_TSIT5,
         result["nfe_reaction"] / ba.STAGE_COUNT_KVAERNO5,
@@ -320,9 +311,6 @@ def plot_event_diagnostics(event_id, cls, channels, dem_raw, dem_norm,
 
     xpos  = np.arange(len(stage_labels))
     width = 0.35
-    # log scale needs strictly-positive bar heights; clamp true zeros to a
-    # sliver for the *drawn* bar only — annotated text always shows the
-    # real (possibly zero) count.
     acc_plot = [max(v, 0.5) for v in accepted]
     rej_plot = [max(v, 0.5) for v in rejected]
 
@@ -366,11 +354,6 @@ def plot_event_diagnostics(event_id, cls, channels, dem_raw, dem_norm,
                  f"imex_ok={result['imex_converged']}  dop_ok={result['dopri5_converged']}")
 
     # ── (0,3) text summary of the divergence-vs-stiffness verdict ───────────
-    # Only meaningful when something actually failed — see
-    # diagnose_stiffness_vs_divergence's docstring in block_a_solver_
-    # benchmark.py for the full rationale (Newton-can't-converge stiffness
-    # and a genuine finite-time blow-up both look like max_steps_reached
-    # with lots of rejections, but call for different fixes).
     ax = axes[0, 3]
     ax.axis("off")
     lines = [f"Divergence-vs-stiffness triage  ({cls})", ""]
@@ -400,8 +383,6 @@ def plot_event_diagnostics(event_id, cls, channels, dem_raw, dem_norm,
         ax.text(0.5, 0.5, "no failing sub-solver\nto diagnose", ha="center",
                 va="center", transform=ax.transAxes, fontsize=10, color="gray")
     else:
-        # If both reaction and dopri5 failed, show whichever has more
-        # accepted-step data to plot (the more informative trajectory).
         kind = max(divergence_diag, key=lambda k: divergence_diag[k]["n_accepted_total"])
         diag = divergence_diag[kind]
         n = diag["n_accepted_total"]
@@ -435,34 +416,10 @@ def plot_event_diagnostics(event_id, cls, channels, dem_raw, dem_norm,
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# PARALLEL WORKER  (runs in a separate PROCESS — see run_one_event's docstring
-# for why this is the stage worth parallelising: each class's IMEX/DOPRI5
-# integration triggers a FRESH JAX/XLA JIT compilation of the Tsit5, Kvaerno5,
-# and Dopri5 step functions (_make_substep_fn builds a brand-new Python
-# closure per call, and jax.jit's cache is keyed on function-object identity,
-# so there is ZERO compilation reuse across classes even when graph shapes
-# match) — on CPU-only JAX this compilation, not the actual step execution,
-# is the dominant per-class cost. Since every class is otherwise fully
-# independent (calibration -- c_sigma, D, sigma_init -- all happen once,
-# up front, before this stage), running classes on separate CPU cores turns
-# ~7 x T_slowest_class wall time into ~T_slowest_class (bounded by whichever
-# class needs the most solver steps -- typically the stiffest one).
+# PARALLEL WORKER
 # ─────────────────────────────────────────────────────────────────────────────
 
 def _run_and_plot_one_class(payload: dict) -> dict:
-    """
-    Top-level (picklable) unit of work for ProcessPoolExecutor. Must be
-    defined at module scope (not nested in main()) so the `spawn` start
-    method can pickle a reference to it and re-import this module fresh in
-    the child process.
-
-    Each child process gets its OWN fresh import of block_a_solver_benchmark
-    (spawn re-executes this file's module-level `import ... as ba`), which
-    resets MAX_STEPS_EXPLICIT/IMPLICIT/DOPRI5 to the file's own defaults --
-    so the same override main() applies to the parent process's `ba` must be
-    re-applied here, per worker, before touching anything that calls
-    diffrax.diffeqsolve.
-    """
     ba.MAX_STEPS_EXPLICIT = payload["max_steps"]
     ba.MAX_STEPS_IMPLICIT = payload["max_steps"]
     ba.MAX_STEPS_DOPRI5   = payload["max_steps_dopri5"]
@@ -475,12 +432,10 @@ def _run_and_plot_one_class(payload: dict) -> dict:
         seed=payload["seed"], n_macro_steps=payload["macro_steps"],
         rtol=payload.get("rtol", ba.RTOL_DEFAULT),
         atol=payload.get("atol", ba.ATOL_DEFAULT),
+        cape_norm=payload.get("cape_norm"),             # Added
+        landtype_grid=payload.get("landtype_grid"),     # Added
     )
 
-    # dem_w here is for the DIAGNOSTIC PLOT ONLY (display panel showing
-    # "DEM x lambda_z"); TemporalSLIC_DEM applies lambda_z internally when
-    # building its own feature cube, so payload["dem_norm"] (raw) is what's
-    # actually fed to run_one_event() above.
     dem_w = payload["dem_norm"] * ba.LAMBDA_Z
     plot_path = plot_event_diagnostics(
         payload["event_id"], payload["cls"], payload["channels"],
@@ -603,21 +558,13 @@ def main():
     os.makedirs(args.out, exist_ok=True)
     N_TEST = args.n
 
-    event_data: dict[str, dict] = {}   # event_id -> {lifecycle_class, channels, dem_raw, dem_norm}
+    event_data: dict[str, dict] = {}   # event_id -> {lifecycle_class, channels, dem_raw, dem_norm, cape, landtype}
 
     if args.real:
         print("Loading real SEVIR data (one event per class)…")
         catalogue = pd.read_csv(ba.CATALOGUE_PATH, low_memory=False)
         sevir_catalog = pd.read_csv(os.path.join(ba.DATA_ROOT, "CATALOG.csv"), low_memory=False)
 
-        # Stage 1: pick one event per class and load its channels (local
-        # HDF5 reads — I/O-bound, and each call opens its own file handle,
-        # so this is safe to parallelise across classes with THREADS rather
-        # than processes). Each thread still tries candidate events for its
-        # OWN class sequentially (same fallback-to-next-candidate logic as
-        # before) — only the 7 per-class searches run concurrently, so
-        # behaviour/output is identical to the sequential version, just
-        # faster wall-clock.
         def _select_event_for_class(cls: str):
             rows = catalogue[catalogue["lifecycle_class"] == cls]
             for _, row in rows.iterrows():
@@ -638,34 +585,36 @@ def main():
                     continue
                 selected[cls] = (event_id, channels)
 
-        # Stage 2: fetch DEM for all selected events up front, in parallel,
-        # before any graph-build / calibration / ODE work starts (same fix
-        # as run_benchmark() in block_a_solver_benchmark.py). Internally,
-        # prefetch_dem_for_events() now dedups by EXTENT (not event_id)
-        # before hitting the network/disk cache — a no-op difference for
-        # this 7-event (one-per-class) smoke test, but it means any of
-        # these events that happen to share a bounding box with each
-        # other, or with a tile already cached by prefetch_dem.py on the
-        # login node, reuse the same fetch.
+        # Stage 2: fetch DEM and Landtype for all selected events up front, in parallel
         channel_shapes = {
             eid: ch["vil"].shape[1:] for eid, ch in selected.values()
         }
         dem_by_event = ba.prefetch_dem_for_events(
             [eid for eid, _ in selected.values()], sevir_catalog, channel_shapes,
         )
-        # Rebuild in LIFECYCLE_CLASSES order (not thread-completion order),
-        # so downstream CSV rows / plots / summary panels stay in the same
-        # deterministic order the sequential version produced.
+        landtype_by_event = ba.prefetch_landtype_for_events(
+            [eid for eid, _ in selected.values()], sevir_catalog, channel_shapes,
+        )
+
         for cls in LIFECYCLE_CLASSES:
             if cls not in selected:
                 continue
             event_id, channels = selected[cls]
+            H_evt, W_evt = channel_shapes[event_id]
+            
             dem_norm = dem_by_event.get(
-                event_id, np.zeros(channel_shapes[event_id], dtype=np.float32)
+                event_id, np.zeros((H_evt, W_evt), dtype=np.float32)
             )
+            cape_norm = ba.load_cape_for_event(event_id, sevir_catalog, H_evt, W_evt)
+            landtype_grid = landtype_by_event.get(
+                event_id, np.zeros((H_evt, W_evt, 2), dtype=np.float32)
+            )
+            
             event_data[cls] = {
                 "event_id": event_id, "channels": channels,
                 "dem_raw": dem_norm, "dem_norm": dem_norm,   # raw already normalised
+                "cape_norm": cape_norm,
+                "landtype_grid": landtype_grid
             }
     else:
         print("Generating synthetic events (one per class)…")
@@ -677,6 +626,8 @@ def main():
             event_data[cls] = {
                 "event_id": f"SYNTH_{cls}", "channels": channels,
                 "dem_raw": dem_raw, "dem_norm": dem_norm,
+                "cape_norm": None,         # Will trigger zero fallbacks gracefully in topology builder
+                "landtype_grid": None,
             }
 
     if not event_data:
@@ -699,17 +650,12 @@ def main():
     print(f"  r_stab(Tsit5) = {r_stab:.4f}   D = {D:.6g}")
 
     # ── A.2: per-class sigma_init (single calibration event per class here) ─
-    # Thread-parallel: build_graph_topological (SLIC via skimage, C-accelerated
-    # and GIL-releasing) + calibrate_class_sigma (jax.jacobian/vmap linear
-    # algebra, no diffrax solve — so no MAX_STEPS_* global to worry about
-    # here) are independent per class and cheap enough that threads (not a
-    # process pool) are the right tool: no compilation-cache duplication
-    # concern, and no cross-process pickling of large arrays needed.
     print("\nCalibrating sigma_init per class (1 event/class — smoke test)…")
     class_sigma: dict[str, float] = {}
 
     def _calibrate_one_class(cls: str, d: dict):
-        g = ba.build_graph_topological(d["channels"], d["dem_norm"], N=N_TEST, c_sigma=c_sigma)
+        g = ba.build_graph_topological(d["channels"], d["dem_norm"], N=N_TEST, c_sigma=c_sigma,
+                                       cape_norm=d.get("cape_norm"), landtype_grid=d.get("landtype_grid"))
         sigma, rho = ba.calibrate_class_sigma(cls, [g], max_iter=8)
         return cls, sigma, rho
 
@@ -728,7 +674,6 @@ def main():
             for fut in as_completed(futures):
                 cls, sigma, rho = fut.result()
                 calib_out[cls] = (sigma, rho)
-        # Print in LIFECYCLE_CLASSES order for deterministic, readable output.
         for cls in event_data:
             sigma, rho = calib_out[cls]
             class_sigma[cls] = sigma
@@ -736,22 +681,19 @@ def main():
                   f"(target={ba.TARGET_RHO.get(cls, float('nan')):.3f})")
 
     # ── A.3: tolerance calibration, against the STIFFEST class present ──────
-    # blocks.tex A.3 (line 218) requires ONE shared (rtol, atol) for every
-    # class; calibrating that shared tolerance against a MILD class (e.g.
-    # STEADY) would converge easily and tell us nothing about whether that
-    # same tolerance is workable for the stiffest class actually being
-    # tested here. So: pick whichever class present has the largest
-    # TARGET_RHO, and run the spec's halving procedure (start rtol=1e-2,
-    # halve until consecutive solutions agree to <1%) against THAT class's
-    # own calibrated weights/graph.
     stiffest_cls = max(class_sigma, key=lambda c: ba.TARGET_RHO.get(c, 0.0))
     print(f"\nCalibrating tolerance (A.3) against {stiffest_cls} "
           f"(stiffest class present, target_rho="
           f"{ba.TARGET_RHO.get(stiffest_cls, float('nan')):.3f})…")
+    
+    stiff_data = event_data[stiffest_cls]
     g_stiff = ba.build_graph_topological(
-        event_data[stiffest_cls]["channels"], event_data[stiffest_cls]["dem_norm"],
+        stiff_data["channels"], stiff_data["dem_norm"],
         N=N_TEST, c_sigma=c_sigma,
+        cape_norm=stiff_data.get("cape_norm"),
+        landtype_grid=stiff_data.get("landtype_grid")
     )
+    
     w_stiff = ba.make_weights(sigma_init=class_sigma[stiffest_cls], seed=0)
     diff_rhs_stiff = ba.make_diffusion_rhs(g_stiff["senders"], g_stiff["receivers"],
                                             g_stiff["edge_weights"], D)
@@ -764,16 +706,6 @@ def main():
           f"rtol={ba.RTOL_DEFAULT:.1e})")
 
     # ── Run the full IMEX-vs-DOPRI5 pipeline for each class ────────────────
-    # THE dominant cost of this script: each class independently triggers a
-    # fresh JAX/XLA JIT compile of Tsit5/Kvaerno5/Dopri5 (see
-    # _run_and_plot_one_class's docstring) plus the actual solve plus
-    # matplotlib rendering. Classes are fully independent once c_sigma / D /
-    # class_sigma are known, so this is the stage worth spending real
-    # parallelism on: a ProcessPoolExecutor (spawn) so each class's
-    # compile+solve+plot runs concurrently on its own CPU core, rather than
-    # ~7x serially. Wall time collapses toward whichever single class needs
-    # the most solver steps (typically the stiffest one), not the sum over
-    # all seven.
     print(f"\nRunning IMEX vs DOPRI5 at N={N_TEST} for each class…")
     n_workers = max(1, min(args.workers or (os.cpu_count() or 1), len(event_data)))
 
@@ -786,6 +718,8 @@ def main():
             "rtol": rtol, "atol": atol,
             "macro_steps": args.macro_steps, "max_steps": args.max_steps,
             "max_steps_dopri5": args.max_steps_dopri5, "out_dir": args.out,
+            "cape_norm": d.get("cape_norm"),            # Added
+            "landtype_grid": d.get("landtype_grid"),    # Added
         }
         for cls, d in event_data.items()
     ]
@@ -807,7 +741,7 @@ def main():
             print(f"    -> {out['plot_path']}")
     else:
         print(f"  (workers={n_workers} processes)")
-        ctx = mp.get_context("spawn")   # JAX + fork don't mix; spawn is required
+        ctx = mp.get_context("spawn")   
         with ProcessPoolExecutor(max_workers=n_workers, mp_context=ctx) as pool:
             futures = {pool.submit(_run_and_plot_one_class, payload): payload["cls"]
                        for payload in payloads}
@@ -829,8 +763,6 @@ def main():
                       f"[{out['wall_s']:.1f}s]")
                 print(f"    -> {out['plot_path']}")
 
-    # Preserve LIFECYCLE_CLASSES order in the summary CSV, regardless of
-    # which worker happened to finish first.
     rows = [outputs[cls]["result"] for cls in event_data if cls in outputs]
 
     df = pd.DataFrame(rows)
