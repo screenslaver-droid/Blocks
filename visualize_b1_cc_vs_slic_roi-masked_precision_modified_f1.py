@@ -51,13 +51,21 @@ Dependencies
 """
 
 import os
+import time
 import argparse
 import logging
+from concurrent.futures import ThreadPoolExecutor, as_completed
 
 import h5py
 import numpy as np
 import pandas as pd
 import cv2
+
+try:
+    from tqdm import tqdm
+except ImportError:
+    def tqdm(iterable, *args, **kwargs):   # no-op fallback if tqdm isn't installed
+        return iterable
 import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
@@ -82,6 +90,13 @@ BASE_PATH    = r"/media/sid_nair/OS/Users/Siddharth Nair/BTP-2/GAT-ODE/SEVIR/201
 CATALOG_PATH = r"/media/sid_nair/OS/Users/Siddharth Nair/BTP-2/GAT-ODE/SEVIR/CATALOG.csv"
 OUT_DIR      = r"/media/sid_nair/OS/Users/Siddharth Nair/BTP-2/GAT-ODE/Blocks/B/B1_Diagnostics"
 os.makedirs(OUT_DIR, exist_ok=True)
+
+# Extent-keyed disk cache for fetched DEM tiles — same directory convention
+# and cache-file naming as block_a_solver_benchmark.py's DEM_CACHE_DIR /
+# _dem_extent_cache_path, so a cache warmed by running Block A's sweep (or
+# the standalone prefetch_dem.py) is picked up here with no extra work, and
+# vice versa.
+DEM_CACHE_DIR = r"C:\Users\Siddharth Nair\OneDrive\Desktop\BTP-2\GAT-ODE\SEVIR\dem_cache"
 
 FUSION_CHANNELS  = ["vil", "ir107", "ir069"]
 COMPACTNESS      = 10.0
@@ -120,17 +135,359 @@ LEVEL_BOUNDARY_COLORS = {
     "high": (0.95, 0.95, 0.95),   # near-white
 }
 
-# Optional DEM support (gracefully degraded, as in the original script)
+# ─────────────────────────────────────────────────────────────────────────────
+# Optional DEM support — ported from block_a_solver_benchmark.py's DEM
+# pipeline (Copernicus DEM GLO-30 via Planetary Computer), gracefully
+# degraded to all-zero terrain if the optional libs aren't installed.
+#
+# This replaces the previous fetch_dem_norm(), which did a single
+# synchronous, un-cached, un-retried, un-timed-out fetch per call: no disk
+# cache (repeated calls across N values / classes / reruns all re-fetched
+# from scratch), tiles collected into one list and merged once at the end
+# (the exact pattern Block A's docstring flags as its DEM OOM cause for
+# events overlapping dozens of tiles), and no timeout on either the STAC
+# search or the tile reads (a single stalled request could hang the whole
+# run). Ported here 1:1 with Block A's fix: extent-keyed disk cache,
+# retry-with-backoff on both STAC search and tile reads, a hard timeout on
+# each, and incremental batched tile merging so peak memory stays bounded
+# regardless of how many tiles a given SEVIR extent overlaps.
+# ─────────────────────────────────────────────────────────────────────────────
 try:
+    import cartopy.crs as ccrs
     import pystac_client
     import planetary_computer
     import rioxarray
     from rioxarray.merge import merge_arrays
     from scipy.interpolate import RegularGridInterpolator
-    import cartopy.crs as ccrs
+
+    # Bottleneck/hang fix (ported from block_a_solver_benchmark.py): GDAL's
+    # VSICURL layer has NO timeout by default, so a single stalled tile
+    # request can block forever. Must be set before any rasterio/GDAL HTTP
+    # read happens.
+    os.environ.setdefault("GDAL_HTTP_TIMEOUT", "30")
+    os.environ.setdefault("GDAL_HTTP_CONNECTTIMEOUT", "10")
+    os.environ.setdefault("GDAL_HTTP_MAX_RETRY", "2")
+    os.environ.setdefault("GDAL_HTTP_RETRY_DELAY", "1")
+    os.environ.setdefault("CPL_VSIL_CURL_CACHE_SIZE", "16000000")
+    os.environ.setdefault("GDAL_CACHEMAX", "256")
+
+    SEVIR_PROJ = ccrs.LambertConformal(
+        central_longitude=-98.0, central_latitude=38.0,
+        standard_parallels=(30.0, 60.0),
+        globe=ccrs.Globe(semimajor_axis=6370000, semiminor_axis=6370000),
+    )
+
+    # Single, size-capped pool for all tile-level fetches, shared across
+    # every event/call — prevents nested per-call pools from multiplying
+    # into an unbounded number of simultaneous full-resolution GeoTIFF
+    # reads once multiple events are prefetched concurrently (see
+    # prefetch_dem_for_extents below), exactly as in Block A.
+    _TILE_FETCH_MAX_WORKERS = 4
+    _tile_fetch_pool = ThreadPoolExecutor(max_workers=_TILE_FETCH_MAX_WORKERS)
+
+    _STAC_SEARCH_TIMEOUT_SEC = 30
+    _TILE_FETCH_TIMEOUT_SEC  = 45
+    _stac_search_pool = ThreadPoolExecutor(max_workers=4)
+
     HAS_DEM_LIBS = True
-except ImportError:
+except ImportError as e:
     HAS_DEM_LIBS = False
+    log.warning(f"DEM/Cartopy libraries not found ({e}) — DEM channel will be "
+                f"all-zeros unless a cached tile already exists under DEM_CACHE_DIR.")
+
+_dem_cache: dict = {}   # in-memory cache, keyed by rounded extent tuple
+
+
+def _dem_extent_cache_path(dem_cache_dir: str, key: tuple) -> str:
+    """
+    Disk cache filename for a (rounded) extent tuple — matches
+    block_a_solver_benchmark._dem_extent_cache_path / prefetch_dem.py's
+    _dem_cache_path EXACTLY, so this script and Block A always agree on
+    where a given extent's tile lives on disk and can share a warm cache.
+    """
+    os.makedirs(dem_cache_dir, exist_ok=True)
+    name = "_".join(f"{v:.4f}" for v in key).replace("-", "m")
+    return os.path.join(dem_cache_dir, f"dem_{name}.npy")
+
+
+def get_sevir_grid(extent, nx: int = 384, ny: int = 384):
+    """Target (lon, lat) grid for an event's SEVIR Lambert-Conformal extent."""
+    proj = SEVIR_PROJ
+    src  = ccrs.PlateCarree()
+    x0, y0 = proj.transform_point(extent[0], extent[2], src)
+    x1, y1 = proj.transform_point(extent[1], extent[3], src)
+    xv, yv = np.meshgrid(np.linspace(x0, x1, nx), np.linspace(y0, y1, ny))
+    grid   = src.transform_points(proj, xv, yv)
+    return grid[..., 0], grid[..., 1]
+
+
+def _load_and_clip_tile(item, extent, buf: float = 0.1, max_retries: int = 3):
+    """Retry-with-backoff tile read (ported from block_a_solver_benchmark's
+    _load_and_clip_tile): a single tile read occasionally drops (transient
+    connection reset / VSICURL hiccup) even with the GDAL_HTTP_* env vars
+    set, so the whole open+clip+coarsen gets its own retry loop before
+    giving up on this one tile."""
+    for attempt in range(max_retries):
+        try:
+            da = rioxarray.open_rasterio(item.assets["data"].href, lock=False).squeeze()
+            da = da.rio.clip_box(minx=extent[0] - buf, miny=extent[2] - buf,
+                                  maxx=extent[1] + buf, maxy=extent[3] + buf)
+            da = da.coarsen(x=3, y=3, boundary="trim").mean().load()
+            return da
+        except Exception:
+            if attempt < max_retries - 1:
+                time.sleep(2)
+            else:
+                raise
+
+
+def _stac_search_items(extent, max_retries: int = 3):
+    """STAC catalog search, retry-with-backoff (ported from
+    block_a_solver_benchmark._stac_search_items). pystac_client's
+    catalog.search() is a plain `requests` call underneath and can hang
+    independently of the GDAL_HTTP_* env vars if the STAC API itself
+    stalls, which is why this is also wrapped with a hard timeout via
+    _stac_search_pool in fetch_and_regrid_dem below."""
+    catalog = pystac_client.Client.open(
+        "https://planetarycomputer.microsoft.com/api/stac/v1",
+        modifier=planetary_computer.sign_inplace,
+    )
+    for attempt in range(max_retries):
+        try:
+            return list(catalog.search(
+                collections=["cop-dem-glo-30"],
+                bbox=[extent[0], extent[2], extent[1], extent[3]],
+            ).item_collection())
+        except Exception:
+            if attempt == max_retries - 1:
+                raise
+            time.sleep(2)
+
+
+def fetch_and_regrid_dem(extent, nx: int = 384, ny: int = 384) -> np.ndarray:
+    """
+    Fetch Copernicus DEM GLO-30 tiles overlapping `extent`
+    (=[llcrnrlon, urcrnrlon, llcrnrlat, urcrnrlat]) from the Planetary
+    Computer STAC API, merge, and regrid onto the SEVIR projection grid.
+    Returns RAW elevation in metres (NOT normalised) — callers normalise.
+
+    Ported from block_a_solver_benchmark.fetch_and_regrid_dem: a single
+    SEVIR event's extent typically overlaps many (often 30-50+) 1-degree
+    GLO-30 tiles, so tiles are merged INCREMENTALLY in small batches as
+    they complete rather than collected into one list and merged once at
+    the end — that all-at-once pattern is what drives peak memory up for
+    events with many overlapping tiles. Tile fetches go through the
+    shared, size-capped _tile_fetch_pool so concurrent fetches across
+    multiple events (see prefetch_dem_for_extents) don't multiply into an
+    unbounded number of simultaneous full-resolution GeoTIFF reads.
+    """
+    if not HAS_DEM_LIBS:
+        return np.zeros((ny, nx), dtype=np.float32)
+
+    cache_key = tuple(np.round(extent, 4))
+    if cache_key in _dem_cache:
+        return _dem_cache[cache_key]
+
+    # Sanity check: a normal SEVIR event extent should span a few degrees
+    # at most. If this fires, either the catalog's lon/lat fields aren't in
+    # degrees, or an upstream extent computation is wrong — either way the
+    # STAC search below could return far more tiles than expected.
+    lon_span = abs(extent[1] - extent[0])
+    lat_span = abs(extent[3] - extent[2])
+    if lon_span > 15 or lat_span > 15:
+        log.warning(
+            f"    Event extent spans {lon_span:.2f}deg lon x {lat_span:.2f}deg lat "
+            f"— abnormally large for a SEVIR patch. This will likely fetch a very "
+            f"large number of DEM tiles. Double check llcrnrlon/urcrnrlon/"
+            f"llcrnrlat/urcrnrlat are in degrees, not projected metres."
+        )
+
+    log.info("    Fetching Cop-DEM-GLO-30 via Planetary Computer ...")
+    try:
+        items = _stac_search_pool.submit(_stac_search_items, extent) \
+                                  .result(timeout=_STAC_SEARCH_TIMEOUT_SEC)
+
+        if not items:
+            log.warning("    No DEM tiles found for this extent — using zeros.")
+            return np.zeros((ny, nx), dtype=np.float32)
+
+        log.info(f"    {len(items)} DEM tile(s) overlap this event's extent "
+                  f"(pool cap: {_TILE_FETCH_MAX_WORKERS} concurrent, shared "
+                  f"across all events being fetched right now).")
+        if len(items) > 80:
+            log.warning(
+                f"    {len(items)} tiles is a LOT for one event — this alone can "
+                f"exhaust memory even with batched merging. Check the extent "
+                f"sanity warning above."
+            )
+
+        fmap = {_tile_fetch_pool.submit(_load_and_clip_tile, it, extent): i
+                for i, it in enumerate(items)}
+
+        running_merged = None
+        batch: list = []
+        BATCH_SIZE = _TILE_FETCH_MAX_WORKERS
+        n_failed = 0
+
+        def _fold_batch():
+            nonlocal running_merged, batch
+            if not batch:
+                return
+            to_merge = ([running_merged] if running_merged is not None else []) + batch
+            running_merged = merge_arrays(to_merge) if len(to_merge) > 1 else to_merge[0]
+            batch = []
+
+        for fut in as_completed(fmap):
+            i = fmap[fut]
+            try:
+                da = fut.result(timeout=_TILE_FETCH_TIMEOUT_SEC)
+                if da is not None and da.size > 0:
+                    batch.append(da)
+                if len(batch) >= BATCH_SIZE:
+                    _fold_batch()
+            except Exception as e:
+                n_failed += 1
+                log.warning(f"    DEM tile {i} failed/timed out: {e}")
+        _fold_batch()
+
+        if n_failed:
+            log.warning(f"    {n_failed}/{len(items)} DEM tiles failed or timed out.")
+
+        if running_merged is None:
+            return np.zeros((ny, nx), dtype=np.float32)
+
+        merged = running_merged
+        lons, lats, vals = merged.x.values, merged.y.values, merged.values.copy()
+        del merged, running_merged, batch
+
+        if lats[0] > lats[-1]:
+            lats = lats[::-1]
+            vals = vals[::-1, :]
+
+        interp = RegularGridInterpolator(
+            (lats, lons), vals.astype(np.float32),
+            method="linear", bounds_error=False, fill_value=0.0,
+        )
+        del vals
+        tgt_lons, tgt_lats = get_sevir_grid(extent, nx, ny)
+        result = interp(
+            np.column_stack((tgt_lats.ravel(), tgt_lons.ravel()))
+        ).reshape(ny, nx).astype(np.float32)
+        _dem_cache[cache_key] = result
+        return result
+    except Exception as exc:
+        log.warning(f"    DEM fetch failed ({exc}) — using zeros.")
+        return np.zeros((ny, nx), dtype=np.float32)
+
+
+def _get_or_fetch_raw_dem(extent, nx: int = 384, ny: int = 384) -> np.ndarray:
+    """
+    Return the RAW (un-normalised, metres) DEM tile for `extent`, at a
+    fixed canonical resolution, using the on-disk EXTENT-keyed cache
+    (_dem_extent_cache_path) in front of fetch_and_regrid_dem(). Fetching
+    at one canonical (ny, nx) regardless of caller shape is what lets a
+    single cached tile be shared across every event/call with this extent
+    (e.g. re-running the diagnostic at several N values, or several
+    classes whose sampled events happen to share a bounding box).
+    """
+    key = tuple(np.round(extent, 4))
+    cache_path = _dem_extent_cache_path(DEM_CACHE_DIR, key)
+
+    if os.path.exists(cache_path):
+        try:
+            cached = np.load(cache_path).astype(np.float32)
+            if cached.shape == (ny, nx) and cached.size > 0:
+                return cached
+        except Exception as exc:
+            log.warning(f"    Could not read cached DEM tile {cache_path} "
+                        f"({exc}) — refetching.")
+
+    dem_raw = fetch_and_regrid_dem(extent, nx=nx, ny=ny)
+    if np.any(dem_raw):   # only cache genuine (non-all-zero) fetches
+        try:
+            np.save(cache_path, dem_raw)
+        except Exception as exc:
+            log.warning(f"    Could not write DEM cache {cache_path}: {exc}")
+
+    return dem_raw
+
+
+def prefetch_dem_for_extents(
+        extents_by_event: dict,
+        max_workers: int = 3,
+) -> dict:
+    """
+    Fetch (or load from disk cache) the DEM tile for EVERY given event's
+    extent up front, in parallel — ported from
+    block_a_solver_benchmark.prefetch_dem_for_events, adapted to take a
+    plain {event_id: extent} map instead of a SEVIR catalog lookup (B1
+    diagnostics are usually run over a handful of hand-picked or
+    per-class-sampled events, not a whole sweep, so the caller already has
+    each event's extent from load_channels() rather than needing this
+    function to look it up itself).
+
+    Events are grouped by their ROUNDED extent first (unique-extent dedup,
+    same as Block A / prefetch_dem.py) so only ONE fetch is issued per
+    unique extent even if several requested events share a bounding box.
+
+    Returns {event_id: dem_norm} — normalised DEM in [0, 1], resized to
+    (384, 384) (B1's fixed target shape). Events whose fetch ultimately
+    fails fall back to an all-zero DEM.
+    """
+    results: dict = {}
+    if not extents_by_event:
+        return results
+
+    extent_to_events: dict[tuple, list] = {}
+    for eid, extent in extents_by_event.items():
+        if extent is None:
+            log.warning(f"    No extent for {eid} — DEM = zeros.")
+            results[eid] = np.zeros((384, 384), dtype=np.float32)
+            continue
+        key = tuple(np.round(extent, 4))
+        extent_to_events.setdefault(key, (extent, []))
+        extent_to_events[key][1].append(eid)
+
+    n_unique = len(extent_to_events)
+    n_cached = sum(
+        1 for key in extent_to_events
+        if os.path.exists(_dem_extent_cache_path(DEM_CACHE_DIR, key))
+    )
+    log.info(
+        f"Prefetching DEM for {len(extents_by_event)} event(s) -> {n_unique} unique "
+        f"extent(s) ({n_cached} already cached, {n_unique - n_cached} to fetch) "
+        f"with up to {max_workers} concurrent workers ..."
+    )
+
+    def _fetch_one(key: tuple):
+        extent, _eids = extent_to_events[key]
+        return key, _get_or_fetch_raw_dem(extent)
+
+    with ThreadPoolExecutor(max_workers=max_workers) as pool:
+        futures = {pool.submit(_fetch_one, key): key for key in extent_to_events}
+        for fut in tqdm(as_completed(futures), total=len(futures),
+                         desc="DEM prefetch (unique extents)"):
+            key = futures[fut]
+            extent, eids = extent_to_events[key]
+            try:
+                _, dem_raw_canonical = fut.result()
+            except Exception as exc:
+                log.warning(f"  extent {key} ({len(eids)} event(s)): "
+                            f"DEM prefetch failed ({exc}) — using zeros.")
+                dem_raw_canonical = np.zeros((384, 384), dtype=np.float32)
+
+            for eid in eids:
+                results[eid] = _normalise_dem_minmax(dem_raw_canonical)
+
+    return results
+
+
+def _normalise_dem_minmax(arr: np.ndarray) -> np.ndarray:
+    """Per-event global min-max scaling to [0,1] — same formula as the
+    Preliminary section's channel normalisation, applied to the DEM tile."""
+    arr_min = float(arr.min())
+    arr_max = float(arr.max())
+    return (arr - arr_min) / (arr_max - arr_min + 1e-6)
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -251,51 +608,29 @@ def build_fused_cube_frame0(data):
 
 
 def fetch_dem_norm(extent, nx=384, ny=384):
-    """Optional DEM channel, gracefully degraded to zeros if unavailable."""
+    """
+    Optional DEM channel, gracefully degraded to zeros if unavailable.
+
+    Thin wrapper over the Block-A-ported pipeline above: extent-keyed disk
+    cache (_get_or_fetch_raw_dem) in front of the retry/timeout-hardened
+    fetch_and_regrid_dem(), then resize to the caller's (ny, nx) and
+    normalise. Same signature and return contract as before, so existing
+    callers (run(), visualize_event() via run(), run_b1_per_class.py) don't
+    need to change — but repeated calls for the same extent (across N
+    values, reruns, or classes whose sampled events share a bounding box)
+    now hit disk cache instead of re-fetching from Planetary Computer every
+    time, and a stalled request can no longer hang the whole diagnostic.
+    """
     if not HAS_DEM_LIBS:
         return np.zeros((ny, nx), dtype=np.float32)
-    try:
-        proj = ccrs.LambertConformal(
-            central_longitude=-98.0, central_latitude=38.0,
-            standard_parallels=(30.0, 60.0),
-            globe=ccrs.Globe(semimajor_axis=6370000, semiminor_axis=6370000),
-        )
-        src = ccrs.PlateCarree()
-        x0, y0 = proj.transform_point(extent[0], extent[2], src)
-        x1, y1 = proj.transform_point(extent[1], extent[3], src)
-        xv, yv = np.meshgrid(np.linspace(x0, x1, nx), np.linspace(y0, y1, ny))
-        grid = src.transform_points(proj, xv, yv)
-        tgt_lons, tgt_lats = grid[..., 0], grid[..., 1]
-
-        catalog = pystac_client.Client.open(
-            "https://planetarycomputer.microsoft.com/api/stac/v1",
-            modifier=planetary_computer.sign_inplace,
-        )
-        items = list(catalog.search(
-            collections=["cop-dem-glo-30"],
-            bbox=[extent[0], extent[2], extent[1], extent[3]],
-        ).item_collection())
-        if not items:
-            return np.zeros((ny, nx), dtype=np.float32)
-
-        das = []
-        for it in items:
-            da = rioxarray.open_rasterio(it.assets["data"].href, lock=False).squeeze()
-            da = da.rio.clip_box(minx=extent[0]-0.1, miny=extent[2]-0.1,
-                                 maxx=extent[1]+0.1, maxy=extent[3]+0.1)
-            das.append(da.coarsen(x=3, y=3, boundary="trim").mean())
-        merged = merge_arrays(das) if len(das) > 1 else das[0]
-        lons, lats, vals = merged.x.values, merged.y.values, merged.values
-        if lats[0] > lats[-1]:
-            lats, vals = lats[::-1], vals[::-1, :]
-        interp = RegularGridInterpolator((lats, lons), vals.astype(np.float32),
-                                         method="linear", bounds_error=False, fill_value=0.0)
-        dem_raw = interp(np.column_stack((tgt_lats.ravel(), tgt_lons.ravel()))
-                         ).reshape(ny, nx).astype(np.float32)
-        return (dem_raw - dem_raw.min()) / (dem_raw.max() - dem_raw.min() + 1e-6)
-    except Exception as exc:
-        log.warning(f"DEM fetch failed ({exc}) — using flat terrain.")
+    if extent is None:
+        log.warning("    No extent given — DEM = zeros.")
         return np.zeros((ny, nx), dtype=np.float32)
+
+    dem_raw = _get_or_fetch_raw_dem(extent, nx=nx, ny=ny)
+    if dem_raw.shape != (ny, nx):
+        dem_raw = cv2.resize(dem_raw, (nx, ny), interpolation=cv2.INTER_CUBIC)
+    return _normalise_dem_minmax(dem_raw)
 
 
 # ─────────────────────────────────────────────────────────────────────────────
