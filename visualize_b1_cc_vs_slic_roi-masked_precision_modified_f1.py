@@ -78,9 +78,9 @@ log = logging.getLogger(__name__)
 # ─────────────────────────────────────────────────────────────────────────────
 # CONFIGURATION (paths match Visualize_sevir_with_superpixel_fused.py)
 # ─────────────────────────────────────────────────────────────────────────────
-BASE_PATH    = r"C:\Users\Siddharth Nair\OneDrive\Desktop\BTP-2\GAT-ODE\SEVIR\2019"
-CATALOG_PATH = r"C:\Users\Siddharth Nair\OneDrive\Desktop\BTP-2\GAT-ODE\SEVIR\CATALOG.csv"
-OUT_DIR      = r"C:\Users\Siddharth Nair\OneDrive\Desktop\BTP-2\GAT-ODE\Blocks\B\B1_Diagnostics"
+BASE_PATH    = r"/media/sid_nair/OS/Users/Siddharth Nair/BTP-2/GAT-ODE/SEVIR/2019"
+CATALOG_PATH = r"/media/sid_nair/OS/Users/Siddharth Nair/BTP-2/GAT-ODE/SEVIR/CATALOG.csv"
+OUT_DIR      = r"/media/sid_nair/OS/Users/Siddharth Nair/BTP-2/GAT-ODE/Blocks/B/B1_Diagnostics"
 os.makedirs(OUT_DIR, exist_ok=True)
 
 FUSION_CHANNELS  = ["vil", "ir107", "ir069"]
@@ -216,15 +216,35 @@ def build_fused_cube_frame0(data):
     of blocks_technical_v2.md) — used ONLY for SLIC feature construction,
     never for the physical-unit connected-component reference.
 
+    min/max are taken over ALL PIXELS AND ALL T FRAMES of the event, per the
+    Preliminary section, NOT just frame 0 — identical to
+    block_a_solver_benchmark.py's _normalise_channel_minmax:
+
+        arr_norm = (arr - arr.min()) / (arr.max() - arr.min() + 1e-6)
+
+    computed on the full (T,H,W) array. Only the resulting *frame-0 slice* of
+    that normalised cube is then used to build the SLIC feature stack — B1
+    intentionally restricts itself to the t=0 branch of TemporalSLIC for the
+    CC-vs-SLIC comparison, so the boundaries being compared are single-frame.
+    But the normalisation *statistics* still have to span all T frames,
+    otherwise this cube's [0,1] scale silently drifts from the one Block A's
+    graphs (and therefore N*) were computed from, for the same event, which
+    is exactly the failure mode the Preliminary section's "identical
+    normalisation" requirement (blocks.tex, Preliminary, line ~45) exists to
+    rule out. Previously this normalised only against frame 0's own min/max,
+    which is a strictly narrower range whenever the event's per-channel
+    extreme occurs off frame 0 (e.g. VIL peaks mid-storm, not at t=0) —
+    fixed here.
+
     Returns (H, W, C) float32 feature cube for frame t=0.
     """
     fused_stack = []
     for ch in FUSION_CHANNELS:
         if ch in data:
-            arr0 = data[ch][0]
-            mn, mx = arr0.min(), arr0.max()
-            norm = (arr0 - mn) / (mx - mn + 1e-6)
-            fused_stack.append(norm)
+            full = data[ch]                      # (T, H, W) — all frames
+            mn, mx = float(full.min()), float(full.max())
+            norm_full = (full - mn) / (mx - mn + 1e-6)
+            fused_stack.append(norm_full[0])      # take t=0 slice AFTER normalising
     if not fused_stack:
         raise ValueError("No fusion channels available for SLIC.")
     return np.stack(fused_stack, axis=-1).astype(np.float32)   # (H, W, C)
