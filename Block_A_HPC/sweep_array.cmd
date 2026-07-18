@@ -14,8 +14,7 @@
 # ─────────────────────────────────────────────────────────────────────────
 
 #PBS -N blockA_sweep
-#PBS -q <QUEUE_NAME>
-#PBS -P <PROJECT_NAME>
+#PBS -q workq
 #PBS -l select=1:ncpus=40
 #PBS -l walltime=24:00:00
 #PBS -J 0-39

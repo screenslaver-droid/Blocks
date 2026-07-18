@@ -7,8 +7,7 @@
 # ─────────────────────────────────────────────────────────────────────────
 
 #PBS -N blockA_merge
-#PBS -q <QUEUE_NAME>
-#PBS -P <PROJECT_NAME>
+#PBS -q small40
 #PBS -l select=1:ncpus=1
 #PBS -l walltime=00:30:00
 #PBS -j oe

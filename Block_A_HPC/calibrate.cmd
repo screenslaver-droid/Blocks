@@ -25,8 +25,7 @@
 # ─────────────────────────────────────────────────────────────────────────
 
 #PBS -N blockA_calib
-#PBS -q <QUEUE_NAME>
-#PBS -P <PROJECT_NAME>
+#PBS -q small20
 #PBS -l select=1:ncpus=20
 #PBS -l walltime=06:00:00
 #PBS -j oe

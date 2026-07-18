@@ -169,11 +169,12 @@ log = logging.getLogger(__name__)
 # ─────────────────────────────────────────────────────────────────────────────
 # CONFIGURATION  — adjust DATA_ROOT / DEM_CACHE_DIR to match your environment
 # ─────────────────────────────────────────────────────────────────────────────
-DATA_ROOT      = r"/media/sid_nair/OS/Users/Siddharth Nair/BTP-2/GAT-ODE/SEVIR"
+DATA_ROOT      = r"/lfs/usrhome/phd/ce24d903/DRIFT/SEVIR"
+OUTPUT_ROOT    = r"/lfs/usrhome/phd/ce24d903/DRIFT/Block_A"
 CATALOGUE_PATH = os.path.join(DATA_ROOT, "event_catalogue.csv")
-OUTPUT_CSV     = os.path.join(DATA_ROOT, "block_a_results.csv")
-SUMMARY_CSV    = os.path.join(DATA_ROOT, "block_a_summary.csv")
-CALIB_JSON     = os.path.join(DATA_ROOT, "block_a_calibration.json")
+OUTPUT_CSV     = os.path.join(OUTPUT_ROOT, "block_a_results.csv")
+SUMMARY_CSV    = os.path.join(OUTPUT_ROOT, "block_a_summary.csv")
+CALIB_JSON     = os.path.join(OUTPUT_ROOT, "block_a_calibration.json")
 DEM_CACHE_DIR  = os.path.join(DATA_ROOT, "dem_cache")   # see load_dem_from_cache()
 
 # E_grid channels 2/3 (blocks.tex line 889, C_env=3: DEM_norm, CAPE_clim,
@@ -328,7 +329,7 @@ except ImportError as e:
 
 def get_local_path(catalog_filename: str) -> Optional[str]:
     """Resolve a catalog-relative filename to an absolute path."""
-    p1 = os.path.join(DATA_ROOT, catalog_filename)
+    p1 = os.path.join(DATA_ROOT,catalog_filename)
     if os.path.exists(p1):
         return p1
     parts = catalog_filename.replace("\\", "/").split("/")
