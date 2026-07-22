@@ -69,11 +69,18 @@ the node 40×.
 ```
 $HOME/blockA_sweep/
 ├── block_a_solver_benchmark.py
+├── block_b3_integration_accuracy.py
 ├── calibrate.cmd
 ├── sweep_array.cmd
 ├── merge.cmd
 ├── merge_results.py
+├── plot_results.py
+├── prefetch_offline_caches.py
 ├── submit_all.sh
+├── sweep_array_b3.cmd
+├── merge_b3.cmd
+├── merge_results_b3.py
+├── submit_all_b3.sh
 └── README.md
 ```
 
@@ -164,24 +171,49 @@ files named this way.
 
 **Not auto-fetched during the sweep** — `load_cape_for_event()` only
 *reads* `cape_clim_<year>_<month:02d>.npy` (e.g. `cape_clim_2019_07.npy`),
-built once by calling `build_era5_cape_climatology()` yourself
-beforehand. That function needs `cdsapi` + a configured `~/.cdsapirc`
-(Copernicus Climate Data Store credentials) and internet access — run it
-interactively/locally, then `rsync cape_cache/` to Aqua. If this
-directory is empty when the sweep runs, CAPE defaults to zeros rather
-than failing (per the script's fallback), so a silently-empty cache is
-easy to miss — check it has 12 files (`cape_clim_2019_01.npy` ...
-`_12.npy`) before trusting results that depend on the CAPE channel.
+built once, beforehand, by `prefetch_offline_caches.py` (see below). If
+this directory is empty when the sweep runs, CAPE defaults to zeros
+rather than failing, so a silently-empty cache is easy to miss — check it
+has 12 files (`cape_clim_2019_01.npy` ... `_12.npy`) before trusting
+results that depend on the CAPE channel.
 
 ### `LANDTYPE_CACHE_DIR` → `DATA_ROOT/landtype_cache/`
 
-Same pattern as CAPE: a one-time, whole-CONUS precompute via
-`build_modis_landtype_grid()` (needs the Planetary Computer STAC libs +
-internet), which `prefetch_landtype_for_events()` then reads from at
-sweep time as a fast path. Unlike CAPE, land-type also has a genuine
-per-event fallback fetch if this cache is cold (see
+Same pattern as CAPE: a one-time, whole-CONUS precompute
+(`prefetch_offline_caches.py` again), producing a single
+`landtype_<year>.npy`, which `prefetch_landtype_for_events()` then reads
+from at sweep time as a fast path. Unlike CAPE, land-type also has a
+genuine per-event fallback fetch if this cache is cold (see
 `prefetch_landtype_for_events`'s docstring) — slower, but it won't
 silently zero out like CAPE does.
+
+### Populating `cape_cache/` and `landtype_cache/`: `prefetch_offline_caches.py`
+
+Run this **once**, on whatever machine actually has outbound internet
+(almost certainly not Aqua's compute nodes — see `calibrate.cmd`'s header
+comment):
+
+```bash
+pip install cdsapi xarray netCDF4                       # for CAPE
+pip install pystac-client planetary-computer rioxarray   # for land-type
+# ~/.cdsapirc must exist first: https://cds.climate.copernicus.eu/how-to-api
+
+python prefetch_offline_caches.py                        # both caches, CAPE_YEAR
+python prefetch_offline_caches.py --skip-cape             # land-type only
+python prefetch_offline_caches.py --skip-landtype         # CAPE only
+python prefetch_offline_caches.py --year 2019 --data-root /path/to/blockA_data
+```
+
+It imports `build_era5_cape_climatology` / `build_modis_landtype_grid`
+straight from `block_a_solver_benchmark.py` (no reimplementation, so the
+cache it produces can't drift from what the main script itself would
+build), reports how many of the 12 monthly CAPE files landed, and prints
+the exact `rsync` commands to copy both folders onto the cluster
+afterward. CAPE resumes cleanly if interrupted — already-cached months
+are skipped on re-run, so just re-run the same command if the CDS API
+times out partway through.
+
+
 
 ### Outputs
 
@@ -199,12 +231,46 @@ silently zero out like CAPE does.
    HDF5 tree to `DATA_ROOT` on Aqua's `/scratch` (not `/home` — SEVIR is
    large; check Aqua's storage quota policy on the Cluster FAQ page).
 2. Build `cape_cache/` and `landtype_cache/` **once**, anywhere with
-   internet, and `rsync` them over too (or warm `dem_cache/` /
-   `cape_cache/` from a queue that has internet, if Aqua has one — see
+   internet, via `prefetch_offline_caches.py`, then `rsync` them over too
+   (or warm them from a queue that has internet, if Aqua has one — see
    the note in `calibrate.cmd`).
 3. Point `DATA_ROOT` at that Aqua path, then run `submit_all.sh`.
 
 
+
+## Plots
+
+`merge.cmd` only produces the two CSVs. To turn `block_a_summary.csv` into
+figures, run `plot_results.py` afterward (anywhere — it only needs
+pandas + matplotlib, not the jax/diffrax/DEM stack, so this is fine to
+run on your laptop against a copied-down `block_a_summary.csv` rather
+than on the cluster):
+
+```bash
+python plot_results.py --summary block_a_summary.csv --out-dir figures
+python plot_results.py --log-y                          # NFE/wall-time span
+                                                          # orders of magnitude
+                                                          # across N=50..2000
+python plot_results.py --classes RAPID_GROWTH STEADY     # subset of classes
+```
+
+Produces four small-multiple panels (one subplot per `lifecycle_class`),
+mean +/- std shaded band vs N:
+- `fig_nfe_vs_N.png` — IMEX total vs DOPRI5 NFE (the main comparison)
+- `fig_wall_time_vs_N.png` — wall-clock seconds, both solvers
+- `fig_nfe_ratio_vs_N.png` — DOPRI5/IMEX NFE ratio
+- `fig_lambda_max_vs_N.png` — lambda_max(L), unit-weighted vs D-weighted
+  (blocks.tex Figure A-4)
+
+A note on reading `fig_nfe_ratio_vs_N.png` and `fig_nfe_vs_N.png` in
+particular: `nfe_reaction` (and therefore `nfe_imex_total`/`nfe_ratio`)
+is a *nominal stage-count proxy* for Kvaerno5, not a measured count —
+see the "How accurate is the NFE proxy" discussion earlier in this
+conversation. Rejected steps also aren't folded into the NFE columns at
+all, only logged separately (`rejected_diff`/`rejected_rxn` /
+`rejected_dopri5`). Treat NFE trends as directional, and cross-check
+against `fig_wall_time_vs_N.png` (a real measurement) where the two
+disagree.
 
 ## Running it
 
@@ -223,7 +289,63 @@ Outputs, once `merge.cmd` finishes: `block_a_results.csv` (one row per
 event × N × seed, ~851 events × 40 N × 5 seeds if the full catalogue is
 that size) and `block_a_summary.csv` (per-class × N aggregates).
 
-## Note on GPU submission
+## Block B3 (integration accuracy vs N) — run after Block A finishes
+
+`block_b3_integration_accuracy.py` imports `block_a_solver_benchmark.py`
+as a library rather than reimplementing anything, so "same randomly
+initialised weight matrices and graph construction as Block A" isn't a
+job-config choice — it's already structural in the script itself:
+
+- Graph: `bA.build_graph_topological(..., c_sigma=...)` called with the
+  **same `c_sigma`/`D`** read from `block_a_calibration.json` — the exact
+  file Block A's `calibrate.cmd` produces. B3 never recalibrates.
+- Weights: `bA.make_weights(sigma_init, seed)` called with the **same
+  `sigma_init`** (per class, from that same JSON) and the **same seed
+  convention** (`range(n_seeds)`) Block A used — `make_weights` is a pure
+  function of `(sigma_init, seed)`, so this is bit-identical, not
+  "reproduced."
+
+What I *did* have to add for the cluster sweep specifically:
+- `--all-events` (mirroring Block A's own flag) — without it, B3 defaults
+  to a 5/class stratified subsample, which wouldn't cover the same event
+  set Block A's `--all-events` sweep did.
+- The same thread-pinning guard as Block A (`OMP_NUM_THREADS=1` etc.) —
+  duplicated at the top of `block_b3_integration_accuracy.py` itself
+  rather than relying on Block A's copy, since this file imports `numpy`
+  directly before it imports `block_a_solver_benchmark`, so Block A's
+  guard would fire one import too late to affect numpy's own BLAS backend
+  otherwise.
+
+**Files**: `sweep_array_b3.cmd` (same 40-way `N = (index+1)*50` array as
+Block A's `sweep_array.cmd`, `--calibration-json` pointed at Block A's
+output), `merge_b3.cmd` + `merge_results_b3.py` (concatenates the 40
+per-N CSVs, rebuilds `block_b3_summary.csv` via `build_summary_b3()`
+over the *full* merged table, and re-runs the elbow heuristic into
+`block_b3_elbow.csv`), and `submit_all_b3.sh` (checks
+`block_a_calibration.json` exists before submitting anything).
+
+```bash
+cd $HOME/blockA_sweep
+bash submit_all.sh      # Block A — wait for this to fully finish
+bash submit_all_b3.sh   # Block B3 — only after block_a_calibration.json exists
+```
+
+One asymmetry worth knowing about: unlike `merge_results.py` (Block A),
+`merge_results_b3.py` imports `block_b3_integration_accuracy.py`, which
+hard-exits at import time if JAX/Diffrax aren't importable (that's
+`block_b3_integration_accuracy.py`'s own existing behavior, not something
+I added) — so `merge_b3.cmd` needs the same `blockA_env` conda
+environment as the sweep itself, not a bare pandas environment.
+
+Outputs, once `merge_b3.cmd` finishes: `block_b3_results.csv` (one row
+per event × N × seed: `eps_int`, `nfe_ref`, `nfe_train`,
+`nfe_ratio_train_over_ref`, wall times, convergence flags),
+`block_b3_summary.csv` (per-class × N mean/std), and `block_b3_elbow.csv`
+(the class-relative elbow heuristic — flagged in that script's own
+docstring as a stand-in for Table 5.6's real per-class N_LFS^c ceiling,
+not a substitute for it).
+
+
 
 The docs you linked also cover GPU (`cudagpu`) job scripts, but I didn't
 build a GPU path here: this workload's parallelism is *already* structured
